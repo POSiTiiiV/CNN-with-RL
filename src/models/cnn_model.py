@@ -3,14 +3,14 @@ import torch.nn as nn
 from torchvision import models
 
 class FlexibleCNN(nn.Module):
-    def __init__(self, num_classes, base_model='resnet50', hyperparams=None):
+    def __init__(self, num_classes, base_model='resnet34', hyperparams=None):
         super(FlexibleCNN, self).__init__()
         self.hyperparams = hyperparams or self._default_hyperparams()
         
         # Load pretrained base model
-        if base_model == 'resnet50':
-            self.base_model = models.resnet50(pretrained=True)
-            feature_dim = self.base_model.fc.in_features
+        if base_model == 'resnet34':
+            self.base_model = models.resnet34(pretrained=True)
+            feature_dim = self.base_model.fc.in_features  # ResNet34 has 512 features vs ResNet50's 2048
             self.base_model.fc = nn.Identity()
         
         # Custom CNN layers
@@ -30,7 +30,7 @@ class FlexibleCNN(nn.Module):
 
     def _default_hyperparams(self):
         return {
-            'layer_sizes': [1024, 512],
+            'layer_sizes': [512, 256],  # Adjusted for ResNet34's smaller feature space
             'dropout_rate': 0.5,
             'learning_rate': 0.001
         }

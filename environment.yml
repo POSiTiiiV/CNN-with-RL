@@ -1,20 +1,23 @@
 name: eye-disease
 channels:
   - pytorch
+  - nvidia
   - conda-forge
   - defaults
 dependencies:
-  - python=3.8
-  - pytorch
-  - torchvision 
-  - cudatoolkit=11.3
-  - tensorflow-gpu
-  - numpy
-  - pandas
-  - pillow
-  - scikit-learn
-  - matplotlib
-  - tqdm
-  - wandb
-  - gym
-  - stable-baselines3
+  - python=3.10
+  - pytorch=2.2.*
+  - torchvision=0.17.*
+  - pytorch-cuda=12.1
+  - numpy=1.26.*
+  - pandas=2.2.*
+  - pillow=10.2.*
+  - scikit-learn=1.4.*
+  - matplotlib=3.8.*
+  - tqdm=4.66.*
+  - wandb=0.16.*
+  - gymnasium=0.29.*  # newer version of gym
+  - stable-baselines3=2.2.*
+  - pip=24.0
+  - pip:
+    - imgaug==0.4.0  # for image augmentation
