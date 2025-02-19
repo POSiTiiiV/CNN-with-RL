@@ -2,6 +2,7 @@ import argparse
 from stable_baselines3 import PPO
 from src.data.fundus_dataset import get_fundus_data_loaders
 from src.rl.hpo_env import HPOEnvironment
+import gymnasium as gym
 
 def main(args):
     # Load data

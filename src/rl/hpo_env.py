@@ -1,6 +1,6 @@
-import gym
+import gymnasium as gym
 import numpy as np
-from gym import spaces
+from gymnasium import spaces
 from ..models.cnn_model import FlexibleCNN
 from ..training.trainer import ModelTrainer
 
@@ -25,13 +25,13 @@ class HPOEnvironment(gym.Env):
             dtype=np.float32
         )
 
-    def reset(self):
+    def reset(self, **kwargs):
         self.current_hyperparams = {
             'learning_rate': 0.001,
             'layer_sizes': [512],
             'dropout_rate': 0.5
         }
-        return self._get_observation()
+        return self._get_observation(), {}
 
     def step(self, action):
         # Update hyperparameters

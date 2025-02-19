@@ -36,7 +36,7 @@ class FundusDataset(Dataset):
         if self.transform:
             image = self.transform(image)
             
-        label = row['label']  # Adjust this based on your CSV column name
+        label = row['labels']  # Adjust this based on your CSV column name
         return image, label
 
 def get_fundus_data_loaders(csv_path, images_dir, batch_size=32, train_split=0.8):

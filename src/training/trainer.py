@@ -2,6 +2,7 @@ import torch
 import wandb
 from tqdm import tqdm
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support
+import gymnasium as gym
 
 class ModelTrainer:
     def __init__(self, model, train_loader, val_loader):
