@@ -9,7 +9,7 @@ class FlexibleCNN(nn.Module):
         
         # Load pretrained base model
         if base_model == 'resnet34':
-            self.base_model = models.resnet34(pretrained=True)
+            self.base_model = models.resnet34(weights=models.ResNet34_Weights.IMAGENET1K_V1)
             feature_dim = self.base_model.fc.in_features  # ResNet34 has 512 features vs ResNet50's 2048
             self.base_model.fc = nn.Identity()
         

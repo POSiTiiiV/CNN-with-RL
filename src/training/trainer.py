@@ -1,4 +1,6 @@
 import torch
+import torch.nn as nn
+import torch.optim as optim
 import wandb
 from tqdm import tqdm
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support
@@ -6,69 +8,77 @@ import gymnasium as gym
 
 class ModelTrainer:
     def __init__(self, model, train_loader, val_loader):
-        self.model = model
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model = model.to(self.device)
         self.train_loader = train_loader
         self.val_loader = val_loader
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.model.to(self.device)
-        self.criterion = torch.nn.CrossEntropyLoss()
-        self.optimizer = model.get_optimizer()
-
-    def train(self, epochs=10):
-        wandb.init(project="eye-disease-cnn")
+        self.criterion = nn.CrossEntropyLoss()
+        self.optimizer = optim.Adam(self.model.parameters())
         
-        best_val_acc = 0
+    def train(self, epochs=1):
+        self.model.train()
+        total_loss = 0
+        correct = 0
+        total = 0
         
-        for epoch in range(epochs):
-            self.model.train()
-            train_loss = 0
+        for batch_idx, batch in enumerate(self.train_loader):
+            # Assuming batch returns (images, labels)
+            if isinstance(batch, (list, tuple)):
+                data, target = batch
+            else:
+                data = batch
+                target = None
             
-            for batch_idx, (data, target) in enumerate(tqdm(self.train_loader)):
-                data, target = data.to(self.device), target.to(self.device)
-                
-                self.optimizer.zero_grad()
-                output = self.model(data)
-                loss = self.criterion(output, target)
-                loss.backward()
-                self.optimizer.step()
-                
-                train_loss += loss.item()
+            # Move data to device
+            data = data.to(self.device)
+            if target is not None:
+                target = target.to(self.device)
             
-            # Validation
-            val_acc, metrics = self.evaluate()
-            wandb.log({
-                'train_loss': train_loss / len(self.train_loader),
-                'val_accuracy': val_acc,
-                'val_precision': metrics['precision'],
-                'val_recall': metrics['recall'],
-                'val_f1': metrics['f1']
-            })
+            self.optimizer.zero_grad()
+            output = self.model(data)
+            loss = self.criterion(output, target)
+            loss.backward()
+            self.optimizer.step()
             
-            if val_acc > best_val_acc:
-                best_val_acc = val_acc
-                
-        return best_val_acc
-
-    def evaluate(self):
+            total_loss += loss.item()
+            _, predicted = output.max(1)
+            total += target.size(0)
+            correct += predicted.eq(target).sum().item()
+            
+            if batch_idx % 10 == 0:
+                wandb.log({
+                    "train_loss": loss.item(),
+                    "train_accuracy": 100. * correct / total
+                })
+        
+        # Validation
+        val_accuracy = self.validate()
+        return val_accuracy
+    
+    def validate(self):
         self.model.eval()
-        predictions = []
-        targets = []
+        correct = 0
+        total = 0
         
         with torch.no_grad():
-            for data, target in self.val_loader:
+            for batch in self.val_loader:
+                # Assuming batch returns (images, labels)
+                if isinstance(batch, (list, tuple)):
+                    data, target = batch
+                else:
+                    data = batch
+                    target = None
+                
+                # Move data to device
                 data = data.to(self.device)
+                if target is not None:
+                    target = target.to(self.device)
+                
                 output = self.model(data)
-                pred = output.argmax(dim=1).cpu().numpy()
-                predictions.extend(pred)
-                targets.extend(target.numpy())
+                _, predicted = output.max(1)
+                total += target.size(0)
+                correct += predicted.eq(target).sum().item()
         
-        accuracy = accuracy_score(targets, predictions)
-        precision, recall, f1, _ = precision_recall_fscore_support(
-            targets, predictions, average='weighted'
-        )
-        
-        return accuracy, {
-            'precision': precision,
-            'recall': recall,
-            'f1': f1
-        }
+        accuracy = 100. * correct / total
+        wandb.log({"val_accuracy": accuracy})
+        return accuracy

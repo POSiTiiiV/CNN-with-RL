@@ -5,8 +5,9 @@ from ..models.cnn_model import FlexibleCNN
 from ..training.trainer import ModelTrainer
 
 class HPOEnvironment(gym.Env):
-    def __init__(self, train_loader, val_loader, num_classes):
+    def __init__(self, trainer, train_loader, val_loader, num_classes):
         super(HPOEnvironment, self).__init__()
+        self.trainer = trainer
         self.train_loader = train_loader
         self.val_loader = val_loader
         self.num_classes = num_classes
@@ -40,9 +41,7 @@ class HPOEnvironment(gym.Env):
         self.current_hyperparams['dropout_rate'] = action[2]
         
         # Train and evaluate model
-        model = FlexibleCNN(self.num_classes, hyperparams=self.current_hyperparams)
-        trainer = ModelTrainer(model, self.train_loader, self.val_loader)
-        val_accuracy = trainer.train(epochs=1)
+        val_accuracy = self.trainer.train(epochs=1)
         
         # Calculate reward
         reward = val_accuracy
