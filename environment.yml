@@ -1,4 +1,4 @@
-name: eye-disease
+name: cnn_rl
 channels:
   - pytorch
   - nvidia
