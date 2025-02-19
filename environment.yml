@@ -1,0 +1,20 @@
+name: eye-disease
+channels:
+  - pytorch
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.8
+  - pytorch
+  - torchvision 
+  - cudatoolkit=11.3
+  - tensorflow-gpu
+  - numpy
+  - pandas
+  - pillow
+  - scikit-learn
+  - matplotlib
+  - tqdm
+  - wandb
+  - gym
+  - stable-baselines3
