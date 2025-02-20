@@ -17,6 +17,7 @@ class FundusDataset(Dataset):
         self.images_dir = images_dir
         self.data = pd.read_csv(csv_path)
         self.transform = transform or self._default_transform()
+        self.class_mapping = {'N':0, 'D':1, 'G':2, 'C':3, 'A':4, 'H':5, 'M':6, 'O':7}
 
     def _default_transform(self):
         return transforms.Compose([
@@ -49,9 +50,9 @@ class FundusDataset(Dataset):
         label_list = ast.literal_eval(label_str)
         
         # Create one-hot encoded tensor
-        label = torch.zeros(8, dtype=torch.float32)  # 8 classes as per CSV
+        label = torch.zeros(len(self.class_mapping), dtype=torch.float32)
         for l in label_list:
-            label[['N','D','G','C','A','H','M','O'].index(l)] = 1.0
+            label[self.class_mapping[l]] = 1.0
             
         return image, label
 
@@ -80,7 +81,19 @@ def get_fundus_data_loaders(csv_path, images_dir, batch_size=32, train_split=0.8
     train_dataset = Subset(dataset, train_indices)
     val_dataset = Subset(dataset, val_indices)
     
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size)
+    num_workers = min(os.cpu_count() or 1, 4)
+    train_loader = DataLoader(
+        train_dataset, 
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=True
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        pin_memory=True
+    )
     
     return train_loader, val_loader

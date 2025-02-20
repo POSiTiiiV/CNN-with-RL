@@ -1,11 +1,12 @@
 import gymnasium as gym
 import numpy as np
 from gymnasium import spaces
+import wandb
 from ..models.cnn_model import FlexibleCNN
 from ..training.trainer import ModelTrainer
 
 class HPOEnvironment(gym.Env):
-    def __init__(self, trainer, train_loader, val_loader, num_classes):
+    def __init__(self, trainer, train_loader, val_loader, num_classes, experiment_name="HPO-CNN"):
         super(HPOEnvironment, self).__init__()
         self.trainer = trainer
         self.train_loader = train_loader
@@ -27,9 +28,29 @@ class HPOEnvironment(gym.Env):
         )
         
         self.current_hyperparams = None
+        self.episode_count = 0
+        self.step_count = 0
+        
+        # Initialize wandb
+        wandb.init(
+            project="cnn-with-rl",
+            name=experiment_name,
+            config={
+                "num_classes": num_classes,
+                "action_space": {
+                    "lr_range": [0.0001, 0.1],
+                    "layer_size_range": [64, 2048],
+                    "dropout_range": [0.1, 0.9]
+                }
+            }
+        )
 
     def reset(self, seed=None, options=None):
+        print("Resetting environment...")
         super().reset(seed=seed)
+        
+        self.episode_count += 1
+        self.step_count = 0
         
         # Reset model with default hyperparameters
         self.current_hyperparams = {
@@ -37,8 +58,10 @@ class HPOEnvironment(gym.Env):
             'layer_sizes': [512],
             'dropout_rate': 0.5
         }
+        print(f"Initial hyperparameters: {self.current_hyperparams}")
         
         # Reinitialize model with default hyperparameters
+        print("Reinitializing model with default parameters...")
         model = FlexibleCNN(
             num_classes=self.num_classes,
             hyperparams=self.current_hyperparams
@@ -46,16 +69,24 @@ class HPOEnvironment(gym.Env):
         
         self.trainer.model = model
         self.trainer.optimizer = model.get_optimizer()
+        print("Model reinitialized")
         
         return self._get_observation(), {}
 
     def step(self, action):
+        print("\nTaking environment step...")
+        self.step_count += 1
+        print(f"Episode {self.episode_count}, Step {self.step_count}")
+        print(f"Action received: {action}")
+        
         # Update hyperparameters
         self.current_hyperparams['learning_rate'] = float(action[0])
         self.current_hyperparams['layer_sizes'] = [int(action[1])]
         self.current_hyperparams['dropout_rate'] = float(action[2])
+        print(f"New hyperparameters: {self.current_hyperparams}")
         
         # Reinitialize model with new hyperparameters
+        print("Reinitializing model with new hyperparameters...")
         model = FlexibleCNN(
             num_classes=self.num_classes,
             hyperparams=self.current_hyperparams
@@ -65,11 +96,29 @@ class HPOEnvironment(gym.Env):
         self.trainer.optimizer = model.get_optimizer()
         
         # Train and evaluate model
+        val_accuracy = 0.0
         try:
+            print("Training model for one epoch...")
             val_accuracy = self.trainer.train(epochs=1)
             reward = val_accuracy
+            
+            # Log metrics to wandb
+            wandb.log({
+                "episode": self.episode_count,
+                "step": self.step_count,
+                "reward": reward,
+                "validation_accuracy": val_accuracy,
+                "learning_rate": self.current_hyperparams['learning_rate'],
+                "layer_size": self.current_hyperparams['layer_sizes'][0],
+                "dropout_rate": self.current_hyperparams['dropout_rate']
+            })
+            
+            print(f"Training complete - Validation accuracy: {val_accuracy:.2f}%")
         except Exception as e:
             print(f"Error during training: {str(e)}")
+            print("Stack trace:")
+            import traceback
+            traceback.print_exc()
             reward = 0.0
         
         done = False
@@ -79,7 +128,11 @@ class HPOEnvironment(gym.Env):
             'hyperparameters': self.current_hyperparams.copy()
         }
         
-        return self._get_observation(), reward, done, truncated, info
+        observation = self._get_observation()
+        print(f"New observation: {observation}")
+        print(f"Reward: {reward}")
+        
+        return observation, reward, done, truncated, info
 
     def _get_observation(self):
         return np.array([
@@ -89,4 +142,6 @@ class HPOEnvironment(gym.Env):
         ])
 
     def close(self):
+        print("Closing environment...")
+        wandb.finish()
         pass
