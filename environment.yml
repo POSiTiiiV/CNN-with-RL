@@ -1,22 +1,28 @@
 name: cnn_rl
 channels:
-  - pytorch
   - conda-forge
-  - defaults
+  - nvidia
+  - pytorch
 dependencies:
-  - python=3.9
-  - pytorch=1.11.0
-  - torchvision=0.12.0
-  - cudatoolkit=11.3
-  - scikit-learn=1.0.2
-  - tqdm=4.64.0
-  - pandas=1.4.2
-  - pillow=9.1.0
-  - numpy=1.22.3
-  - wandb=0.12.21
-  - pip
+  - python=3.9.21
+  - pip=25.0
+  - numpy=1.26.4
+  - scipy=1.13.1
+  - pandas=2.2.3
+  - matplotlib=3.9.4
+  - scikit-learn=1.6.1
+  - opencv-python=4.11.0.86
+  - pytorch=2.5.1
+  - torchvision=0.20.1
+  - torchaudio=2.5.1
+  - pytorch-cuda=12.4
+  - stable-baselines3=2.5.0
+  - gymnasium=1.0.0
+  - tqdm=4.67.1
+  - tensorboard=2.19.0
   - pip:
-      - stable-baselines3==1.4.0
-      - gym==0.19.0
-      - torchmetrics==0.7.3
-      - protobuf==3.20.*
+      - wandb==0.19.6
+      - absl-py==2.1.0
+      - cloudpickle==3.1.1
+      - gymnasium==1.0.0
+      - pygame==2.6.1

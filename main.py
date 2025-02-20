@@ -7,6 +7,7 @@ from src.models.cnn_model import FlexibleCNN
 from src.training.trainer import ModelTrainer
 from src.rl.hpo_env import HPOEnvironment
 import gymnasium as gym
+import numpy as np
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -16,7 +17,8 @@ def parse_args():
                       help="Path to merged_images folder")
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--num_classes", type=int, default=8)
-    parser.add_argument("--rl_steps", type=int, default=5)  # Reduced steps for testing
+    parser.add_argument("--rl_steps", type=int, default=20480,  # 10 updates * 2048 steps
+                      help="Number of timesteps for RL training")
     parser.add_argument("--experiment_name", type=str, default="HPO-CNN-Test",
                       help="Name for the wandb experiment")
     return parser.parse_args()
@@ -56,33 +58,41 @@ def main(args):
         use_wandb=True  # Enable wandb in trainer
     )
     
-    # Create RL environment
+    # Create RL environment with explicit float32 bounds
     print("Creating RL environment...")
     env = HPOEnvironment(
         trainer=trainer,
         train_loader=train_loader,
         val_loader=val_loader,
         num_classes=args.num_classes,
-        experiment_name=args.experiment_name
+        experiment_name=args.experiment_name,
+        dtype=np.float32  # Explicitly set dtype for Box spaces
     )
     print("Action space:", env.action_space)
     print("Observation space:", env.observation_space)
     
     try:
-        # Initialize RL agent with custom parameters for quick testing
+        # Initialize RL agent with better default parameters
         print("Initializing PPO agent...")
         rl_model = PPO(
             "MlpPolicy", 
             env, 
             verbose=1,
-            n_steps=5,  # Collect 5 steps of experience per update
-            batch_size=5,  # Process all steps at once (must be <= n_steps)
-            n_epochs=1,  # Single epoch of policy optimization
-            learning_rate=0.001,
+            device='cpu',
+            n_steps=2048,      # Default PPO steps per update
+            batch_size=64,     # Reasonable batch size for training
+            n_epochs=10,       # More epochs for better policy optimization
+            learning_rate=3e-4, # Standard learning rate for PPO
             clip_range=0.2,
-            ent_coef=0.01,  # Add some exploration
-            vf_coef=0.5,  # Value function coefficient
-            max_grad_norm=0.5  # Clip gradients
+            ent_coef=0.01,     # Encourage exploration
+            vf_coef=0.5,       # Balance value function learning
+            max_grad_norm=0.5,  # Prevent exploding gradients
+            policy_kwargs=dict(
+                net_arch=dict(
+                    pi=[64, 64],  # Policy network architecture
+                    vf=[64, 64]   # Value function network architecture
+                )
+            )
         )
         
         # Train RL agent

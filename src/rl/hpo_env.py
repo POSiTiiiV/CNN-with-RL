@@ -4,9 +4,13 @@ from gymnasium import spaces
 import wandb
 from ..models.cnn_model import FlexibleCNN
 from ..training.trainer import ModelTrainer
+from rich.console import Console
+from rich.panel import Panel
+
+console = Console()
 
 class HPOEnvironment(gym.Env):
-    def __init__(self, trainer, train_loader, val_loader, num_classes, experiment_name="HPO-CNN"):
+    def __init__(self, trainer, train_loader, val_loader, num_classes, experiment_name="HPO-CNN", dtype=np.float32):
         super(HPOEnvironment, self).__init__()
         self.trainer = trainer
         self.train_loader = train_loader
@@ -15,16 +19,16 @@ class HPOEnvironment(gym.Env):
         
         # Define action and observation spaces
         self.action_space = spaces.Box(
-            low=np.array([0.0001, 64, 0.1]),  # lr, layer_size, dropout
-            high=np.array([0.1, 2048, 0.9]),
-            dtype=np.float32
+            low=np.array([1e-4, 64, 0.1], dtype=dtype),  # lr, layer_size, dropout
+            high=np.array([1e-1, 2048, 0.9], dtype=dtype),
+            dtype=dtype
         )
         
         self.observation_space = spaces.Box(
-            low=0,
-            high=1,
+            low=0.0,
+            high=1.0,
             shape=(3,),  # Current lr, layer_size, dropout
-            dtype=np.float32
+            dtype=dtype
         )
         
         self.current_hyperparams = None
@@ -45,8 +49,15 @@ class HPOEnvironment(gym.Env):
             }
         )
 
+        console.print(Panel.fit(
+            "[bold blue]HPO Environment Initialized\n"
+            f"Action Space: {self.action_space}\n"
+            f"Observation Space: {self.observation_space}",
+            title="Environment Setup"
+        ))
+
     def reset(self, seed=None, options=None):
-        print("Resetting environment...")
+        console.print(Panel.fit("[bold yellow]Resetting environment...", title="Reset"))
         super().reset(seed=seed)
         
         self.episode_count += 1
@@ -58,7 +69,7 @@ class HPOEnvironment(gym.Env):
             'layer_sizes': [512],
             'dropout_rate': 0.5
         }
-        print(f"Initial hyperparameters: {self.current_hyperparams}")
+        console.print(f"[blue]Initial hyperparameters: {self.current_hyperparams}")
         
         # Reinitialize model with default hyperparameters
         print("Reinitializing model with default parameters...")
@@ -74,7 +85,11 @@ class HPOEnvironment(gym.Env):
         return self._get_observation(), {}
 
     def step(self, action):
-        print("\nTaking environment step...")
+        console.print(Panel.fit(
+            f"[bold cyan]Episode {self.episode_count}, Step {self.step_count}\n"
+            f"Action: {action}",
+            title="Environment Step"
+        ))
         self.step_count += 1
         print(f"Episode {self.episode_count}, Step {self.step_count}")
         print(f"Action received: {action}")

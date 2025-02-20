@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 from torchvision import models
 import torch.nn.functional as F
+from torch.amp import autocast
 
 class FlexibleCNN(nn.Module):
     def __init__(self, num_classes, base_model='resnet34', hyperparams=None):
@@ -35,8 +36,8 @@ class FlexibleCNN(nn.Module):
         }
 
     def forward(self, x):
-        # Efficient forward pass
-        with torch.cuda.amp.autocast():
+        # Updated autocast usage
+        with autocast('cuda'):
             features = self.base_model(x)
             x = F.relu(self.fc1(features), inplace=True)  # inplace ReLU saves memory
             x = self.dropout(x)
