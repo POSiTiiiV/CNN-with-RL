@@ -1,13 +1,12 @@
 import argparse
 import torch
-import wandb
 from stable_baselines3 import PPO
 from src.data.fundus_dataset import get_fundus_data_loaders
 from src.models.cnn_model import FlexibleCNN
 from src.training.trainer import ModelTrainer
 from src.rl.hpo_env import HPOEnvironment
-import gymnasium as gym
 import numpy as np
+import wandb
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -23,11 +22,44 @@ def parse_args():
                       help="Name for the wandb experiment")
     return parser.parse_args()
 
+def create_ppo_agent(env):
+    # Custom schedule for exploration rate
+    def exploration_schedule(progress):
+        return max(0.05, 0.5 * (1 - progress))  # Reduce from 0.5 to 0.05
+
+    return PPO(
+        "MlpPolicy",
+        env,
+        verbose=1,
+        device='cpu',
+        n_steps=2048,
+        batch_size=64,
+        n_epochs=10,
+        learning_rate=3e-4,
+        ent_coef=exploration_schedule,  # Dynamic exploration rate
+        clip_range=0.2,
+        vf_coef=0.5,
+        max_grad_norm=0.5,
+        policy_kwargs=dict(
+            net_arch=dict(
+                pi=[128, 128],  # Larger policy network
+                vf=[128, 128]   # Larger value network
+            ),
+            log_std_init=-2.0,  # Lower initial exploration
+            ortho_init=True     # Better weight initialization
+        ),
+        # Enable learning from past episodes
+        use_sde=True,          # State-Dependent Exploration
+        sde_sample_freq=4,     # Update exploration noise every 4 steps
+    )
+
 def main(args):
+    # Initialize wandb
+    wandb.init(project="cnn-with-rl", name=args.experiment_name)
+    
     # Check CUDA availability
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
-    print(f"CUDA available: {torch.cuda.is_available()}")
     if torch.cuda.is_available():
         print(f"GPU: {torch.cuda.get_device_name(0)}")
     
@@ -39,27 +71,25 @@ def main(args):
         batch_size=args.batch_size
     )
     print(f"Dataset loaded - Training batches: {len(train_loader)}, Validation batches: {len(val_loader)}")
-    print(f"Batch size: {args.batch_size}")
     
     # Initialize model
     print("Initializing CNN model...")
     model = FlexibleCNN(num_classes=args.num_classes)
     model = model.to(device)
-    print(f"Model initialized with {args.num_classes} classes")
-    print("Model architecture:")
-    print(model)
     
     # Initialize trainer
-    print("Setting up model trainer...")
     trainer = ModelTrainer(
         model=model,
         train_loader=train_loader,
         val_loader=val_loader,
-        use_wandb=True  # Enable wandb in trainer
+        use_wandb=True,  # Enable wandb in trainer
+        rl_agent=None  # Placeholder for RL agent
     )
     
+    # Increase training steps
+    args.rl_steps = 40960  # Double the steps
+    
     # Create RL environment with explicit float32 bounds
-    print("Creating RL environment...")
     env = HPOEnvironment(
         trainer=trainer,
         train_loader=train_loader,
@@ -68,32 +98,10 @@ def main(args):
         experiment_name=args.experiment_name,
         dtype=np.float32  # Explicitly set dtype for Box spaces
     )
-    print("Action space:", env.action_space)
-    print("Observation space:", env.observation_space)
+    print("RL environment created")
     
     try:
-        # Initialize RL agent with better default parameters
-        print("Initializing PPO agent...")
-        rl_model = PPO(
-            "MlpPolicy", 
-            env, 
-            verbose=1,
-            device='cpu',
-            n_steps=2048,      # Default PPO steps per update
-            batch_size=64,     # Reasonable batch size for training
-            n_epochs=10,       # More epochs for better policy optimization
-            learning_rate=3e-4, # Standard learning rate for PPO
-            clip_range=0.2,
-            ent_coef=0.01,     # Encourage exploration
-            vf_coef=0.5,       # Balance value function learning
-            max_grad_norm=0.5,  # Prevent exploding gradients
-            policy_kwargs=dict(
-                net_arch=dict(
-                    pi=[64, 64],  # Policy network architecture
-                    vf=[64, 64]   # Value function network architecture
-                )
-            )
-        )
+        rl_model = create_ppo_agent(env)
         
         # Train RL agent
         print(f"Starting training for {args.rl_steps} steps...")
@@ -103,47 +111,37 @@ def main(args):
             # Store training history
             if locals.get('self') and hasattr(locals['self'], 'env'):
                 try:
-                    val_accuracy = locals['self'].env.get_attr('trainer')[0].validate()['accuracy']
+                    reward = locals.get('rewards', [0])[0]
                     history.append({
                         'step': len(history),
-                        'reward': locals.get('rewards', [0])[0],
-                        'val_accuracy': val_accuracy
+                        'reward': reward
                     })
-                    print(f"Step {len(history)}: Reward = {history[-1]['reward']:.2f}, "
-                          f"Validation Accuracy = {val_accuracy:.2f}%")
+                    print(f"Step {len(history)}: Reward = {reward:.2f}")
+                    wandb.log({
+                        "step": len(history),
+                        "reward": reward
+                    })
                 except Exception as e:
-                    print(f"Warning: Could not log step metrics: {str(e)}")
+                    pass
             return True
         
         rl_model.learn(
             total_timesteps=args.rl_steps,
-            callback=callback,
-            progress_bar=True
+            callback=callback
         )
         print("Training completed")
         
-        # Print final results
-        print("\nTraining History:")
-        for step in history:
-            print(f"Step {step['step']}: Reward = {step['reward']:.2f}, "
-                  f"Validation Accuracy = {step['val_accuracy']:.2f}%")
-        
         # Save the best model
-        print("Saving model...")
         rl_model.save("best_hpo_model")
         print("Model saved successfully")
         
     except Exception as e:
-        print(f"Error during training: {str(e)}")
-        print("Stack trace:")
-        import traceback
-        traceback.print_exc()
         raise
     finally:
         # Clean up
-        print("Cleaning up...")
         env.close()
-        print("Done")
+        print("Environment closed")
+        wandb.finish()
 
 if __name__ == "__main__":
     args = parse_args()

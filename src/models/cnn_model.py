@@ -32,7 +32,8 @@ class FlexibleCNN(nn.Module):
         return {
             'layer_sizes': [512],  # Simplified architecture
             'dropout_rate': 0.5,
-            'learning_rate': 0.001
+            'learning_rate': 0.001,
+            'weight_decay': 0.01  # Ensure weight_decay is included
         }
 
     def forward(self, x):
@@ -57,6 +58,6 @@ class FlexibleCNN(nn.Module):
                     classifier_params.append(param)
         
         return torch.optim.Adam([
-            {'params': base_params, 'lr': self.hyperparams['learning_rate'] * 0.1},
-            {'params': classifier_params, 'lr': self.hyperparams['learning_rate']}
+            {'params': base_params, 'lr': self.hyperparams['learning_rate'] * 0.1, 'weight_decay': self.hyperparams['weight_decay']},
+            {'params': classifier_params, 'lr': self.hyperparams['learning_rate'], 'weight_decay': self.hyperparams['weight_decay']}
         ])
