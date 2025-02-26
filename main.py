@@ -298,7 +298,7 @@ def main():
         
         # Evaluate on test set
         logger.info("Evaluating on test set...")
-        test_loss, test_acc = cnn_trainer.evaluate(test_loader)
+        test_loss, test_acc = cnn_trainer.evaluate(test_loader).values()
         
         # Convert the values to float before formatting
         try:

@@ -126,33 +126,18 @@ class ModelTrainer:
             self._update_history(epoch, train_metrics, val_metrics, epoch_time)
             
             # Convert metrics to float before logging
-            try:
-                train_loss = float(train_metrics['loss'])
-                train_acc = float(train_metrics['accuracy'])
-                val_loss = float(val_metrics['loss'])
-                val_acc = float(val_metrics['accuracy'])
+            train_loss = float(train_metrics['loss'])
+            train_acc = float(train_metrics['accuracy'])
+            val_loss = float(val_metrics['loss'])
+            val_acc = float(val_metrics['accuracy'])
 
-                # Log to console
-                logger.info(f"Epoch {epoch}/{self.max_epochs} - "
-                        f"train_loss: {train_loss:.4f}, "
-                        f"train_acc: {train_acc:.4f}, "
-                        f"val_loss: {val_loss:.4f}, "
-                        f"val_acc: {val_acc:.4f}, "
-                        f"time: {epoch_time:.2f}s")
-            except (ValueError, TypeError) as e:
-                logger.warning(f"Error converting metrics to float: {e}")
-                train_loss = train_metrics['loss']
-                train_acc = train_metrics['accuracy']
-                val_loss = val_metrics['loss']
-                val_acc = val_metrics['accuracy']
-
-                # Log to console
-                logger.info(f"Epoch {epoch}/{self.max_epochs} - "
-                        f"train_loss: {train_loss}, "
-                        f"train_acc: {train_acc}, "
-                        f"val_loss: {val_loss}, "
-                        f"val_acc: {val_acc}, "
-                        f"time: {epoch_time}s")
+            # Log to console
+            logger.info(f"Epoch {epoch}/{self.max_epochs} - "
+                    f"train_loss: {train_loss:.4f}, "
+                    f"train_acc: {train_acc:.4f}, "
+                    f"val_loss: {val_loss:.4f}, "
+                    f"val_acc: {val_acc:.4f}, "
+                    f"time: {epoch_time:.2f}s")
             
             # Log to wandb
             if self.use_wandb:
