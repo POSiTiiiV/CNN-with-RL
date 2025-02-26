@@ -1,148 +1,367 @@
+import os
 import argparse
-import torch
-from stable_baselines3 import PPO
-from src.data.fundus_dataset import get_fundus_data_loaders
-from src.models.cnn_model import FlexibleCNN
-from src.training.trainer import ModelTrainer
-from src.rl.hpo_env import HPOEnvironment
+import logging
+import yaml
+import time
+import json
+from datetime import datetime
+import random
 import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, random_split
+import torchvision
+import torchvision.transforms as transforms
 import wandb
 
+# Import project modules
+from src.models.cnn import PretrainedCNN
+from src.models.rl_agent import HyperParameterOptimizer, OfflineHPOptimizer
+from src.trainers.cnn_trainer import CNNTrainer
+from src.trainers.trainer import ModelTrainer
+from src.envs.hpo_env import HPOEnvironment
+from src.data_loaders.data_loader import load_dataset  # Import the new data loader module
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler('training.log')
+    ]
+)
+logger = logging.getLogger(__name__)
+
 def parse_args():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--csv_path", type=str, default="csv_files/balanced_full_df.csv",
-                      help="Path to balanced_full_df.csv")
-    parser.add_argument("--images_dir", type=str, default="datasets/merged_images",
-                      help="Path to merged_images folder")
-    parser.add_argument("--batch_size", type=int, default=32)
-    parser.add_argument("--num_classes", type=int, default=8)
-    parser.add_argument("--rl_steps", type=int, default=20480,  # 10 updates * 2048 steps
-                      help="Number of timesteps for RL training")
-    parser.add_argument("--experiment_name", type=str, default="HPO-CNN-Test",
-                      help="Name for the wandb experiment")
+    """Parse command line arguments"""
+    parser = argparse.ArgumentParser(
+        description="Train CNN with RL-based hyperparameter optimization"
+    )
+    parser.add_argument(
+        "--config", type=str, default="configs/default.yaml",
+        help="Path to configuration file"
+    )
+    # Update default path to the custom images folder
+    parser.add_argument(
+        "--data-dir", type=str, default="data/merged_images",
+        help="Directory for custom image dataset"
+    )
+    parser.add_argument(
+        "--output-dir", type=str, default="./output",
+        help="Directory for output files"
+    )
+    parser.add_argument(
+        "--wandb", action="store_true", default=True,
+        help="Enable Weights & Biases logging"
+    )
+    parser.add_argument(
+        "--no-wandb", action="store_false", dest="wandb",
+        help="Disable Weights & Biases logging"
+    )
+    parser.add_argument(
+        "--wandb-project", type=str, default=None,
+        help="Weights & Biases project name"
+    )
+    parser.add_argument(
+        "--wandb-name", type=str, default=None,
+        help="Weights & Biases run name"
+    )
+    parser.add_argument(
+        "--seed", type=int, default=42,
+        help="Random seed for reproducibility"
+    )
+    parser.add_argument(
+        "--epochs", type=int, default=None,
+        help="Number of training epochs (overrides config)"
+    )
+    parser.add_argument(
+        "--batch-size", type=int, default=None,
+        help="Batch size for training (overrides config)"
+    )
+    parser.add_argument(
+        "--resume", type=str, default=None,
+        help="Path to checkpoint to resume training from"
+    )
+    parser.add_argument(
+        "--pretrain-rl", action="store_true", default=False,
+        help="Pretrain RL agent before CNN training"
+    )
+    parser.add_argument(
+        "--device", type=str, default=None,
+        help="Device to use (cuda, cuda:0, cpu, etc.)"
+    )
+    
     return parser.parse_args()
 
-def create_ppo_agent(env):
-    # Custom schedule for exploration rate
-    def exploration_schedule(progress):
-        return max(0.05, 0.5 * (1 - progress))  # Reduce from 0.5 to 0.05
+def load_config(config_path):
+    """Load configuration from YAML file"""
+    try:
+        with open(config_path, "r") as f:
+            config = yaml.safe_load(f)
+        logger.info(f"Loaded configuration from {config_path}")
+        return config
+    except Exception as e:
+        logger.error(f"Failed to load configuration from {config_path}: {e}")
+        raise
 
-    return PPO(
-        "MlpPolicy",
-        env,
-        verbose=1,
-        device='cpu',
-        n_steps=2048,
-        batch_size=64,
-        n_epochs=10,
-        learning_rate=3e-4,
-        ent_coef=exploration_schedule,  # Dynamic exploration rate
-        clip_range=0.2,
-        vf_coef=0.5,
-        max_grad_norm=0.5,
-        policy_kwargs=dict(
-            net_arch=dict(
-                pi=[128, 128],  # Larger policy network
-                vf=[128, 128]   # Larger value network
-            ),
-            log_std_init=-2.0,  # Lower initial exploration
-            ortho_init=True     # Better weight initialization
-        ),
-        # Enable learning from past episodes
-        use_sde=True,          # State-Dependent Exploration
-        sde_sample_freq=4,     # Update exploration noise every 4 steps
-    )
-
-def main(args):
-    # Initialize wandb
-    wandb.init(project="cnn-with-rl", name=args.experiment_name)
-    
-    # Check CUDA availability
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
+def set_seed(seed):
+    """Set random seed for reproducibility"""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
     if torch.cuda.is_available():
-        print(f"GPU: {torch.cuda.get_device_name(0)}")
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        # Set deterministic behavior
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+    logger.info(f"Set random seed to {seed}")
+
+def get_device(args_device=None):
+    """Get device for PyTorch"""
+    if args_device:
+        device = torch.device(args_device)
+    else:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    # Load data
-    print("Loading datasets...")
-    train_loader, val_loader = get_fundus_data_loaders(
-        csv_path=args.csv_path,
-        images_dir=args.images_dir,
-        batch_size=args.batch_size
-    )
-    print(f"Dataset loaded - Training batches: {len(train_loader)}, Validation batches: {len(val_loader)}")
+    logger.info(f"Using device: {device}")
+    if device.type == 'cuda':
+        logger.info(f"GPU: {torch.cuda.get_device_name(device)}")
+        logger.info(f"GPU Memory: {torch.cuda.get_device_properties(device).total_memory / 1e9:.2f} GB")
     
-    # Initialize model
-    print("Initializing CNN model...")
-    model = FlexibleCNN(num_classes=args.num_classes)
-    model = model.to(device)
+    return device
+
+def create_model(config, device):
+    """Create CNN model"""
+    # Update config with dataset-specific parameters
+    dataset_name = config["data"]["dataset_name"].lower()
+    if dataset_name == "cifar10":
+        config["model"]["num_classes"] = 10
+    elif dataset_name == "cifar100":
+        config["model"]["num_classes"] = 100
     
-    # Initialize trainer
-    trainer = ModelTrainer(
-        model=model,
-        train_loader=train_loader,
-        val_loader=val_loader,
-        use_wandb=True,  # Enable wandb in trainer
-        rl_agent=None  # Placeholder for RL agent
-    )
+    # Create model
+    model = PretrainedCNN(config["model"])
+    model.to(device)
     
-    # Increase training steps
-    args.rl_steps = 40960  # Double the steps
+    logger.info(f"Created model: {type(model).__name__}")
+    logger.info(f"Model config: {config['model']}")
     
-    # Create RL environment with explicit float32 bounds
-    env = HPOEnvironment(
-        trainer=trainer,
-        train_loader=train_loader,
-        val_loader=val_loader,
-        num_classes=args.num_classes,
-        experiment_name=args.experiment_name,
-        dtype=np.float32  # Explicitly set dtype for Box spaces
-    )
-    print("RL environment created")
+    return model
+
+def init_wandb(args, config):
+    """Initialize Weights & Biases for experiment tracking"""
+    if not args.wandb:
+        logger.info("Weights & Biases logging disabled")
+        return False
     
     try:
-        rl_model = create_ppo_agent(env)
+        # Override config with command line arguments if provided
+        wandb_config = config.get("wandb", {})
+        project_name = args.wandb_project or wandb_config.get("project", "CNN-with-RL")
+        run_name = args.wandb_name or wandb_config.get("run_name") or f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         
-        # Train RL agent
-        print(f"Starting training for {args.rl_steps} steps...")
-        history = []
-        
-        def callback(locals, globals):
-            # Store training history
-            if locals.get('self') and hasattr(locals['self'], 'env'):
-                try:
-                    reward = locals.get('rewards', [0])[0]
-                    history.append({
-                        'step': len(history),
-                        'reward': reward
-                    })
-                    print(f"Step {len(history)}: Reward = {reward:.2f}")
-                    wandb.log({
-                        "step": len(history),
-                        "reward": reward
-                    })
-                except Exception as e:
-                    pass
-            return True
-        
-        rl_model.learn(
-            total_timesteps=args.rl_steps,
-            callback=callback
+        # Initialize wandb
+        wandb.init(
+            project=project_name,
+            name=run_name,
+            config=config,
+            dir=args.output_dir
         )
-        print("Training completed")
         
-        # Save the best model
-        rl_model.save("best_hpo_model")
-        print("Model saved successfully")
+        logger.info(f"Initialized Weights & Biases: project='{project_name}', run='{run_name}'")
+        return True
+    except Exception as e:
+        logger.warning(f"Failed to initialize Weights & Biases: {e}")
+        return False
+
+def save_config(config, output_dir):
+    """Save configuration to output directory"""
+    os.makedirs(output_dir, exist_ok=True)
+    config_path = os.path.join(output_dir, "config.yaml")
+    with open(config_path, "w") as f:
+        yaml.dump(config, f, default_flow_style=False)
+    logger.info(f"Saved configuration to {config_path}")
+
+def main():
+    """Main function"""
+    # Parse command line arguments
+    args = parse_args()
+    
+    # Set random seed
+    set_seed(args.seed)
+    
+    # Determine device for training
+    device = get_device(args.device)
+    
+    # Load configuration
+    config = load_config(args.config)
+    
+    # Override config with command line arguments
+    if args.epochs is not None:
+        config["training"]["max_epochs"] = args.epochs
+    if args.batch_size is not None:
+        config["training"]["batch_size"] = args.batch_size
+    
+    # Update config paths
+    config["output_dir"] = args.output_dir
+    config["data_dir"] = args.data_dir
+    
+    # Update wandb config
+    config["logging"]["use_wandb"] = args.wandb
+    if args.wandb_project:
+        config.setdefault("wandb", {})["project"] = args.wandb_project
+    if args.wandb_name:
+        config.setdefault("wandb", {})["run_name"] = args.wandb_name
+    
+    # Create output directory
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_dir = os.path.join(args.output_dir, f"run_{timestamp}")
+    os.makedirs(run_dir, exist_ok=True)
+    
+    # Set up logging directories
+    log_dir = os.path.join(run_dir, "logs")
+    os.makedirs(log_dir, exist_ok=True)
+    config["logging"]["log_dir"] = log_dir
+    
+    # Save configuration
+    save_config(config, run_dir)
+    
+    # Initialize wandb - ensure this is done BEFORE any calls to wandb.log()
+    wandb_initialized = init_wandb(args, config)
+    
+    try:
+        # Load dataset
+        train_dataset, val_dataset, test_dataset, train_loader, val_loader, test_loader = load_dataset(
+            config, args.data_dir
+        )
+        
+        # Create model
+        model = create_model(config, device)
+        
+        # Create CNN trainer
+        cnn_trainer = CNNTrainer(
+            model=model,
+            train_loader=train_loader,  # Pass the loader instead of dataset
+            val_loader=val_loader,      # Pass the loader instead of dataset
+            config=config["training"]
+        )
+        
+        # Create hyperparameter optimization environment
+        hpo_env = HPOEnvironment(
+            cnn_trainer=cnn_trainer,
+            config=config["env"],
+            render_mode="human" if config.get("verbose", False) else None
+        )
+        
+        # Create RL optimizer
+        rl_optimizer = HyperParameterOptimizer(
+            env=hpo_env,
+            config=config["rl"]
+        )
+        
+        # Pretrain RL agent if specified
+        if args.pretrain_rl:
+            logger.info("Pretraining RL agent...")
+            offline_optimizer = OfflineHPOptimizer(
+                env=hpo_env,
+                config=config["rl"]
+            )
+            pretrain_results = offline_optimizer.train_offline()
+            logger.info(f"RL agent pretraining complete. Best reward: {pretrain_results.get('best_reward')}")
+            
+            # Use the pretrained agent for optimization
+            rl_optimizer = offline_optimizer.optimizer
+        
+        # Create model trainer
+        trainer = ModelTrainer(
+            cnn_trainer=cnn_trainer,
+            rl_optimizer=rl_optimizer,
+            config=config
+        )
+        
+        # Resume from checkpoint if specified
+        if args.resume:
+            logger.info(f"Resuming training from checkpoint: {args.resume}")
+            trainer.load_checkpoint(args.resume)
+        
+        # Train model with RL-based hyperparameter optimization
+        logger.info("Starting training with RL-based hyperparameter optimization...")
+        start_time = time.time()
+        
+        history = trainer.train(epochs=args.epochs)
+        
+        training_time = time.time() - start_time
+        logger.info(f"Training completed in {training_time:.2f} seconds")
+        
+        # Evaluate on test set
+        logger.info("Evaluating on test set...")
+        test_loss, test_acc = cnn_trainer.evaluate(test_loader)
+        
+        # Convert the values to float before formatting
+        try:
+            test_acc = float(test_acc) if isinstance(test_acc, str) else test_acc
+            test_loss = float(test_loss) if isinstance(test_loss, str) else test_loss
+            logger.info(f"Test accuracy: {test_acc:.4f}, Test loss: {test_loss:.4f}")
+        except (ValueError, TypeError):
+            # If conversion fails, log without formatting
+            logger.info(f"Test accuracy: {test_acc}, Test loss: {test_loss}")
+            logger.warning("Could not format test metrics as floats. Check data types.")
+        
+        # Save results
+        results_file = os.path.join(run_dir, "results.json")
+        with open(results_file, "w") as f:
+            json.dump({
+                "best_val_accuracy": trainer.best_val_accuracy,
+                "best_val_loss": trainer.best_val_loss,
+                "test_acc": test_acc,
+                "test_loss": test_loss,
+                "training_time": training_time,
+                "epochs": trainer.current_epoch + 1,
+                "early_stopped": trainer.epochs_without_improvement >= trainer.early_stopping_patience,
+                "rl_interventions_count": len(trainer.history["rl_interventions"]),
+            }, f, indent=2)
+        
+        logger.info(f"Results saved to {results_file}")
+        
+        # Finalize wandb
+        if wandb_initialized:
+            # Log final results
+            wandb.log({
+                "best_val_accuracy": trainer.best_val_accuracy,
+                "best_val_loss": trainer.best_val_loss,
+                "test_acc": test_acc,
+                "test_loss": test_loss,
+                "training_time": training_time,
+                "final_epoch": trainer.current_epoch + 1,
+            })
+            
+            # Save artifacts
+            best_model_path = os.path.join(log_dir, "best_model.pt")
+            if os.path.isfile(best_model_path):
+                model_artifact = wandb.Artifact(
+                    name=f"model_{wandb.run.id}",
+                    type="model",
+                    description="Trained CNN model with RL-optimized hyperparameters"
+                )
+                model_artifact.add_file(best_model_path)
+                wandb.log_artifact(model_artifact)
+            else:
+                logger.warning(f"Best model file not found: {best_model_path}")
+            
+            wandb.finish()
+        
+        logger.info("Training completed successfully!")
         
     except Exception as e:
+        logger.exception(f"Error during training: {e}")
+        if wandb_initialized and wandb.run:
+            # Log error and finish wandb run
+            wandb.log({"error": str(e)})
+            wandb.finish(exit_code=1)
         raise
-    finally:
-        # Clean up
-        env.close()
-        print("Environment closed")
-        wandb.finish()
 
 if __name__ == "__main__":
-    args = parse_args()
-    main(args)
+    main()

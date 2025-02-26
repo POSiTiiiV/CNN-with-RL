@@ -1,0 +1,14 @@
+numpy
+scipy
+pandas
+matplotlib
+scikit-learn
+opencv-python
+tqdm
+rich
+tensorboard
+scikit-image
+gymnasium
+stable-baselines3
+wandb
+psutil

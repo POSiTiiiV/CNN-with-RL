@@ -1,0 +1,25 @@
+# CNN Model Configuration
+model:
+  in_channels: 3
+  num_classes: 8  # Updated for eye disease classes
+  
+# Training Configuration
+training:
+  batch_size: 24  # Slightly reduced batch size for medical images
+  learning_rate: 0.0005
+  epochs: 15
+  max_epochs: 75
+  early_stopping_patience: 12
+  eval_frequency: 1
+  checkpoint_frequency: 5
+  min_epochs_before_intervention: 5
+  
+# Data Configuration
+data:
+  dataset_name: "eye_disease"  # Custom eye disease dataset
+  train_val_split: 0.75  # 75% train, 25% validation
+  image_size: 224  # Size for resizing images
+  num_workers: 4
+  
+# Other sections remain the same as default.yaml
+# ...

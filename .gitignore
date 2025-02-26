@@ -164,4 +164,6 @@ cython_debug/
 idk/
 wandb/
 data/
+output/
+logs/
 test.py

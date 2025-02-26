@@ -1,0 +1,55 @@
+# CNN Model Configuration
+model:
+  in_channels: 3
+  num_classes: 8  # Will be automatically updated based on dataset
+  
+# Training Configuration
+training:
+  batch_size: 32  # Reduced batch size for larger images
+  learning_rate: 0.001
+  epochs: 30
+  max_epochs: 50
+  early_stopping_patience: 10
+  eval_frequency: 1
+  checkpoint_frequency: 5
+  min_epochs_before_intervention: 5
+  intervention_frequency: 3
+  stagnation_threshold: 0.005
+  
+# Reinforcement Learning Configuration
+rl:
+  learning_rate: 0.0003
+  episodes: 50
+  steps_per_episode: 5
+  max_steps_per_episode: 5
+  n_steps: 2048  # Number of steps to collect before updating policy
+  batch_size: 64  # Minibatch size for policy update
+  n_epochs: 10  # Number of epochs when optimizing the surrogate loss
+  gamma: 0.99  # Discount factor
+  
+# Environment Configuration
+env:
+  hyperparameter_ranges:
+    learning_rate: [0.0001, 0.01]  # Min, Max values
+    dropout_rate: [0.1, 0.9]
+    weight_decay: [1e-6, 1e-2]
+  
+# Data Configuration
+data:
+  dataset_name: "custom"  # Changed to use custom dataset
+  train_val_split: 0.8
+  image_size: 224  # Size for resizing images (suitable for ResNet34)
+  num_workers: 4
+  
+# Logging Configuration
+logging:
+  log_dir: "logs"
+  save_model_dir: "models"
+  tensorboard_dir: "logs/tensorboard"
+  use_wandb: true
+  
+# Weights & Biases Configuration
+wandb:
+  project: "CNN-with-RL"
+  run_name: null  # Will be auto-generated based on timestamp if null
+  log_interval: 1  # Log every N epochs

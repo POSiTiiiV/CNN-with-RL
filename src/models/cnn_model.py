@@ -1,63 +1,35 @@
 import torch
 import torch.nn as nn
-from torchvision import models
 import torch.nn.functional as F
-from torch.amp import autocast
 
-class FlexibleCNN(nn.Module):
-    def __init__(self, num_classes, base_model='resnet34', hyperparams=None):
-        super(FlexibleCNN, self).__init__()
-        self.hyperparams = hyperparams or self._default_hyperparams()
+class CNNModel(nn.Module):
+    def __init__(self, config):
+        super(CNNModel, self).__init__()
+        # Get parameters from config
+        in_channels = config.get('in_channels', 3)
+        num_classes = config.get('num_classes', 10)
         
-        # Load pretrained base model with efficient memory loading
-        if base_model == 'resnet34':
-            self.base_model = models.resnet34(weights=models.ResNet34_Weights.IMAGENET1K_V1)
-            feature_dim = self.base_model.fc.in_features
-            self.base_model.fc = nn.Identity()
-            
-            # Freeze early layers to speed up training
-            for param in list(self.base_model.parameters())[:-9]:  # Keep last 3 layers trainable
-                param.requires_grad = False
-        
-        # Custom CNN layers with efficient memory usage
-        self.fc1 = nn.Linear(feature_dim, self.hyperparams['layer_sizes'][0])
-        self.dropout = nn.Dropout(self.hyperparams['dropout_rate'])
-        self.final = nn.Linear(self.hyperparams['layer_sizes'][0], num_classes)
-        
-        # Initialize weights properly
-        nn.init.kaiming_normal_(self.fc1.weight)
-        nn.init.kaiming_normal_(self.final.weight)
-
-    def _default_hyperparams(self):
-        return {
-            'layer_sizes': [512],  # Simplified architecture
-            'dropout_rate': 0.5,
-            'learning_rate': 0.001,
-            'weight_decay': 0.01  # Ensure weight_decay is included
-        }
+        # Default architecture, will be optimized by RL
+        self.conv1 = nn.Conv2d(in_channels, 32, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv2d(32, 64, kernel_size=3, padding=1)
+        self.pool = nn.MaxPool2d(2, 2)
+        self.fc1 = nn.Linear(64 * 8 * 8, 128)  # Assuming 32x32 input -> 8x8 after two pooling
+        self.fc2 = nn.Linear(128, num_classes)
+        self.dropout = nn.Dropout(0.5)
 
     def forward(self, x):
-        # Updated autocast usage
-        with autocast('cuda'):
-            features = self.base_model(x)
-            x = F.relu(self.fc1(features), inplace=True)  # inplace ReLU saves memory
-            x = self.dropout(x)
-            x = self.final(x)
+        x = self.pool(F.relu(self.conv1(x)))
+        x = self.pool(F.relu(self.conv2(x)))
+        x = x.view(-1, 64 * 8 * 8)  # Flatten
+        x = F.relu(self.fc1(x))
+        x = self.dropout(x)
+        x = self.fc2(x)
         return x
-
-    def get_optimizer(self):
-        # Use different learning rates for frozen and trainable layers
-        base_params = []
-        classifier_params = []
-        
-        for name, param in self.named_parameters():
-            if param.requires_grad:
-                if 'base_model' in name:
-                    base_params.append(param)
-                else:
-                    classifier_params.append(param)
-        
-        return torch.optim.Adam([
-            {'params': base_params, 'lr': self.hyperparams['learning_rate'] * 0.1, 'weight_decay': self.hyperparams['weight_decay']},
-            {'params': classifier_params, 'lr': self.hyperparams['learning_rate'], 'weight_decay': self.hyperparams['weight_decay']}
-        ])
+    
+    def update_hyperparams(self, hyperparams):
+        """
+        Update model hyperparameters based on RL suggestions
+        """
+        # Implementation for dynamically updating model architecture
+        # Will be expanded based on specific hyperparameters to optimize
+        pass
