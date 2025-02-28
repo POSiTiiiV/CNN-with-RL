@@ -8,11 +8,6 @@ from datetime import datetime
 import random
 import numpy as np
 import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import DataLoader, random_split
-import torchvision
-import torchvision.transforms as transforms
 import wandb
 
 # Import project modules
@@ -298,7 +293,7 @@ def main():
         
         # Evaluate on test set
         logger.info("Evaluating on test set...")
-        test_loss, test_acc = cnn_trainer.evaluate(test_loader).values()
+        test_loss, test_acc = cnn_trainer.evaluate(test_loader)
         
         # Convert the values to float before formatting
         try:

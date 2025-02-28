@@ -7,10 +7,6 @@ from stable_baselines3.common.callbacks import BaseCallback
 
 logger = logging.getLogger(__name__)
 
-def get_device():
-    """Get available device - forcing CPU for PPO"""
-    return "cpu"  # Forces CPU usage for PPO as recommended
-
 class EvaluationCallback(BaseCallback):
     """
     Callback for evaluating the agent's performance during training.
@@ -157,7 +153,7 @@ class HyperParameterOptimizer:
         Determine why intervention is needed based on performance trends.
         
         Args:
-            history: Dictionary containing training and validation metrics
+            val_acc_history & val_loss_history: Dictionary containing training and validation metrics
         """
         
         logged = False

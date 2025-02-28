@@ -1,8 +1,7 @@
 import gymnasium as gym
 import numpy as np
 from gymnasium import spaces
-import torch
-import torch.nn as nn
+import math
 import copy
 from typing import Dict, List, Tuple, Optional, Any
 import logging
@@ -56,7 +55,7 @@ class HPOEnvironment(gym.Env):
             9,   # dropout_rate: 9 options (0.1 to 0.9)
             8,   # weight_decay: 8 options
             3,   # optimizer_type: 3 options
-            6    # fc_config: 6 different configurations
+            3    # fc_config: 6 different configurations
         ]
         self.action_space = spaces.MultiDiscrete(self.action_dims)
         
@@ -87,15 +86,20 @@ class HPOEnvironment(gym.Env):
         self.optimizer_types = ['adam', 'sgd', 'adamw']
         
         # FC layer configurations mapping
+        # self.fc_configs = [
+        #     [512, 256],
+        #     [1024, 512],
+        #     [2048, 1024],
+        #     [512, 256, 128],
+        #     [1024, 512, 256],
+        #     [2048, 1024, 512]
+        # ]
         self.fc_configs = [
-            [512, 256],
-            [1024, 512],
-            [2048, 1024],
-            [512, 256, 128],
-            [1024, 512, 256],
-            [2048, 1024, 512]
+            [512, 256],       # Small  
+            [1024, 512],      # Medium  
+            [1024, 512, 256]  # Complex  
         ]
-        
+
     def action_to_hp_dict(self, action):
         """Convert MultiDiscrete action to hyperparameter dictionary"""
         return {
@@ -196,10 +200,10 @@ class HPOEnvironment(gym.Env):
         
         # Train for defined number of epochs
         for _ in range(self.epochs_per_step):
-            train_loss, train_acc = self.cnn_trainer.train_epoch()
+            train_loss, train_acc = self.cnn_trainer.train_epoch().values()
         
         # Evaluate on validation set
-        val_loss, val_acc = self.cnn_trainer.evaluate()
+        val_loss, val_acc = self.cnn_trainer.evaluate().values()
         
         # Update history
         self.history['val_acc'].append(val_acc)
@@ -262,23 +266,23 @@ class HPOEnvironment(gym.Env):
         Returns:
             float: The reward value
         """
-        # Base reward is proportional to validation accuracy
-        reward = val_acc
-        
-        # Add bonus for improvement over best score
+        reward = math.log(1 + val_acc) - 0.1 * val_loss  
+
+        # Bonus for improvement
         if val_acc > self.best_val_acc:
             improvement = val_acc - self.best_val_acc
             reward += self.reward_scaling * improvement
-        
-        # Add bonus for exploring new configurations
+
+        # Exploration bonus
         if is_new_config:
             reward += self.exploration_bonus
-            
-        # Add penalty for no improvement
-        if self.no_improvement_count > 0:
-            reward -= 0.1 * self.no_improvement_count
-            
-        return reward
+
+        # Penalty for no improvement
+        reward -= 0.1 * self.no_improvement_count
+
+        # Prevent negative rewards
+        return max(0, reward)
+
     
     def reset(self, seed: Optional[int] = None, options: Optional[dict] = None) -> Tuple[np.ndarray, Dict[str, Any]]:
         """
@@ -336,7 +340,7 @@ class HPOEnvironment(gym.Env):
                 self.best_hyperparams = {}
         
         # Initial evaluation to get baseline metrics
-        val_loss, val_acc = self.cnn_trainer.evaluate()
+        val_loss, val_acc = self.cnn_trainer.evaluate().values()
         train_loss = val_loss  # Placeholder until we train
         train_acc = val_acc    # Placeholder until we train
         

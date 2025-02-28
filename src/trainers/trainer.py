@@ -273,17 +273,10 @@ class ModelTrainer:
         Returns:
             bool: True if intervention occurred, False otherwise
         """
-        # Only consider intervention after minimum number of epochs
-        if self.current_epoch < self.min_epochs_before_intervention:
-            return False
             
         # Get validation history for RL agent
         val_acc_history = self.history['val_acc']
         val_loss_history = self.history['val_loss']
-        
-        # Skip if we don't have enough history
-        if len(val_acc_history) < self.min_epochs_before_intervention:
-            return False
             
         # Prepare observation for RL agent
         observation = self._prepare_observation()
@@ -422,7 +415,7 @@ class ModelTrainer:
             }
 
     def _update_history(self, epoch: int, train_metrics: Dict[str, float], 
-                        val_metrics: Union[Dict[str, float], Tuple[float, float]], epoch_time: float) -> None:
+                        val_metrics: Dict[str, float], epoch_time: float) -> None:
         """
         Update training history with latest metrics.
         
@@ -432,23 +425,12 @@ class ModelTrainer:
             val_metrics: Validation metrics dict or tuple
             epoch_time: Time taken for this epoch
         """
-        # Handle train metrics (which could be tuple or dict)
-        if isinstance(train_metrics, tuple):
-            train_loss, train_acc = train_metrics
-        elif isinstance(train_metrics, dict):
-            train_loss = train_metrics.get('loss', 0)
-            train_acc = train_metrics.get('accuracy', 0)
-        else:
-            train_loss, train_acc = 0, 0
-            
-        # Handle validation metrics (which could be tuple or dict)
-        if isinstance(val_metrics, tuple):
-            val_loss, val_acc = val_metrics
-        elif isinstance(val_metrics, dict):
-            val_loss = val_metrics.get('loss', 0)
-            val_acc = val_metrics.get('accuracy', 0)
-        else:
-            val_loss, val_acc = 0, 0
+        # Update epoch history with latest metrics
+        train_loss = train_metrics.get('loss', 0)
+        train_acc = train_metrics.get('accuracy', 0)
+        val_loss = val_metrics.get('loss', 0)
+        val_acc = val_metrics.get('accuracy', 0)
+        
             
         # Update history
         self.history['train_loss'].append(train_loss)
@@ -656,19 +638,25 @@ class ModelTrainer:
                 logger.warning(f"Error finalizing wandb run: {str(e)}")
 
     def _is_training_stagnated(self):
-        """Check if training progress has stagnated based on validation accuracy"""
+        """Check if training progress has stagnated based on validation accuracy and loss"""
         val_acc_history = self.history['val_acc']
-        if len(val_acc_history) < 4:
-            return False
-            
-        # Calculate improvement over last 3 validation accuracies
-        improvements = [val_acc_history[-i] - val_acc_history[-i-1] 
-                for i in range(1, 4)]
-        avg_improvement = sum(improvements) / len(improvements)
+        val_loss_history = self.history['val_loss']
         
-        # Training is stagnated if average improvement is below threshold
-        logger.info(f"Average improvement over last 3 epochs: {avg_improvement:.4f} and threshold: {self.stagnation_threshold}")
-        return avg_improvement < self.stagnation_threshold
+        if len(val_acc_history) < 4:
+            return False  # Not enough data to check stagnation
+        
+        # Compute accuracy improvement over last 3 epochs
+        acc_improvements = [val_acc_history[-i] - val_acc_history[-i-1] for i in range(1, 4)]
+        avg_acc_improvement = sum(acc_improvements) / len(acc_improvements)
+        
+        # Compute loss trend over last 3 epochs
+        loss_trend = val_loss_history[-1] - val_loss_history[-4]
+        
+        logger.info(f"Avg Acc Improvement: {avg_acc_improvement:.4f}, Loss Trend: {loss_trend:.4f}")
+
+        # Stagnation happens if accuracy improves too little AND loss isn't improving
+        return avg_acc_improvement < self.stagnation_threshold and loss_trend >= 0
+
     
     def _should_intervene(self):
         """Determine if the RL agent should intervene in the training process"""
