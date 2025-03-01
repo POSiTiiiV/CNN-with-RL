@@ -12,7 +12,7 @@ import wandb
 
 # Import project modules
 from src.models.cnn import PretrainedCNN
-from src.models.rl_agent import HyperParameterOptimizer, OfflineHPOptimizer
+from src.models.rl_agent import HyperParameterOptimizer
 from src.trainers.cnn_trainer import CNNTrainer
 from src.trainers.trainer import ModelTrainer
 from src.envs.hpo_env import HPOEnvironment
@@ -80,8 +80,8 @@ def parse_args():
         help="Path to checkpoint to resume training from"
     )
     parser.add_argument(
-        "--pretrain-rl", action="store_true", default=False,
-        help="Pretrain RL agent before CNN training"
+        "--rl-brain", type=str, default=None,
+        help="Path to pre-trained RL brain to load"
     )
     parser.add_argument(
         "--device", type=str, default=None,
@@ -132,10 +132,6 @@ def create_model(config, device):
     """Create CNN model"""
     # Update config with dataset-specific parameters
     dataset_name = config["data"]["dataset_name"].lower()
-    if dataset_name == "cifar10":
-        config["model"]["num_classes"] = 10
-    elif dataset_name == "cifar100":
-        config["model"]["num_classes"] = 100
     
     # Create model
     model = PretrainedCNN(config["model"])
@@ -229,7 +225,7 @@ def main():
     
     try:
         # Load dataset
-        train_dataset, val_dataset, test_dataset, train_loader, val_loader, test_loader = load_dataset(
+        train_loader, val_loader, test_loader = load_dataset(
             config, args.data_dir
         )
         
@@ -239,8 +235,8 @@ def main():
         # Create CNN trainer
         cnn_trainer = CNNTrainer(
             model=model,
-            train_loader=train_loader,  # Pass the loader instead of dataset
-            val_loader=val_loader,      # Pass the loader instead of dataset
+            train_loader=train_loader,
+            val_loader=val_loader,
             config=config["training"]
         )
         
@@ -257,18 +253,14 @@ def main():
             config=config["rl"]
         )
         
-        # Pretrain RL agent if specified
-        if args.pretrain_rl:
-            logger.info("Pretraining RL agent...")
-            offline_optimizer = OfflineHPOptimizer(
-                env=hpo_env,
-                config=config["rl"]
-            )
-            pretrain_results = offline_optimizer.train_offline()
-            logger.info(f"RL agent pretraining complete. Best reward: {pretrain_results.get('best_reward')}")
-            
-            # Use the pretrained agent for optimization
-            rl_optimizer = offline_optimizer.optimizer
+        # Load pre-trained RL brain if specified
+        if args.rl_brain:
+            brain_path = args.rl_brain
+            logger.info(f"Loading pre-trained RL brain from {brain_path}")
+            if rl_optimizer.load_brain(brain_path):
+                logger.info("Successfully loaded RL brain")
+            else:
+                logger.warning(f"Failed to load RL brain, using new agent")
         
         # Create model trainer
         trainer = ModelTrainer(
@@ -309,7 +301,7 @@ def main():
         results_file = os.path.join(run_dir, "results.json")
         with open(results_file, "w") as f:
             json.dump({
-                "best_val_accuracy": trainer.best_val_accuracy,
+                "best_val_accuracy": trainer.best_val_accu,
                 "best_val_loss": trainer.best_val_loss,
                 "test_acc": test_acc,
                 "test_loss": test_loss,
@@ -321,11 +313,16 @@ def main():
         
         logger.info(f"Results saved to {results_file}")
         
+        # Save final RL brain
+        final_brain_path = os.path.join(run_dir, "final_rl_brain.zip")
+        rl_optimizer.save_brain(final_brain_path)
+        logger.info(f"Final RL brain saved to {final_brain_path}")
+        
         # Finalize wandb
         if wandb_initialized:
             # Log final results
             wandb.log({
-                "best_val_accuracy": trainer.best_val_accuracy,
+                "best_val_accuracy": trainer.best_val_accu,
                 "best_val_loss": trainer.best_val_loss,
                 "test_acc": test_acc,
                 "test_loss": test_loss,

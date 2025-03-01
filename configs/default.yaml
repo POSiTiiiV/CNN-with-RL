@@ -39,7 +39,18 @@ data:
   dataset_name: "custom"  # Changed to use custom dataset
   train_val_split: 0.8
   image_size: 224  # Size for resizing images (suitable for ResNet34)
-  num_workers: 4
+  num_workers: 4  # Will be automatically limited to 1 on Windows
+  # Image caching options
+  cache_images: false  # Disabled PIL image caching to save memory
+  cache_tensors: true  # Cache transformed tensor images (preferred)
+  use_global_cache: true  # Share cache across train/val/test datasets
+  minimal_transform: true  # Use minimal transformations for preprocessed images
+  # DataLoader optimization
+  persistent_workers: true # Keep worker processes alive between epochs
+  warmup_loaders: true     # Warm up loaders before training starts
+  prefetch_factor: 2       # Number of batches to prefetch per worker
+  # Memory management
+  max_cache_size_gb: 4     # Maximum cache size in GB
   
 # Logging Configuration
 logging:

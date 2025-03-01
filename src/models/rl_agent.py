@@ -62,9 +62,18 @@ class HyperParameterOptimizer:
         self.gae_lambda = config.get('gae_lambda', 0.95)
         self.clip_range = config.get('clip_range', 0.2)
         self.normalize_advantage = config.get('normalize_advantage', True)
+        self.brain_save_dir = config.get('brain_save_dir', 'models/rl_brains')
         
         # Set environment's max steps
         self.env.max_steps = self.max_steps_per_episode
+        
+        # Training state variables
+        self.last_observation = None
+        self.last_action = None
+        self.training_step = 0
+        
+        # Ensure brain save directory exists
+        os.makedirs(self.brain_save_dir, exist_ok=True)
         
         # Initialize the RL agent - force CPU usage
         logger.info(f"Initializing PPO agent with learning rate {self.learning_rate}")
@@ -90,35 +99,6 @@ class HyperParameterOptimizer:
         
         logger.info("HyperParameterOptimizer initialized")
     
-    def train(self, total_timesteps=100000):
-        """
-        Train the RL agent to optimize hyperparameters.
-        
-        Args:
-            total_timesteps: Total number of timesteps to train the agent
-            
-        Returns:
-            trained agent
-        """
-        logger.info(f"Starting RL agent training for {total_timesteps} timesteps")
-        
-        try:
-            self.agent.learn(
-                total_timesteps=total_timesteps,
-                callback=self.eval_callback,
-                log_interval=10
-            )
-            
-            # Save the trained model
-            self.agent.save("final_model")
-            logger.info("RL agent training completed and model saved")
-            
-        except Exception as e:
-            logger.error(f"Error during RL agent training: {str(e)}")
-            raise
-            
-        return self.agent
-    
     def optimize_hyperparameters(self, observation, val_acc_history=None, val_loss_history=None):
         """
         Determine if intervention is needed and suggest hyperparameter changes.
@@ -132,11 +112,20 @@ class HyperParameterOptimizer:
             dict: Suggested hyperparameter changes
         """
         # Check if intervention is needed
-        self.why_intervene(val_acc_history, val_loss_history)
+        should_intervene = self._should_intervene(val_acc_history, val_loss_history)
+        
+        if not should_intervene:
+            return None
+        
+        # Store current observation for later training
+        self.last_observation = observation.copy()
         
         # Get action from RL agent
         try:
             action, _ = self.agent.predict(observation.reshape(1, -1))
+            
+            # Store action for later training
+            self.last_action = action[0].copy()
             
             # Convert action to hyperparameter dictionary
             hyperparams = self.env.action_to_hp_dict(action[0])
@@ -148,6 +137,136 @@ class HyperParameterOptimizer:
             logger.error(f"Error during hyperparameter optimization: {str(e)}")
             return None
     
+    def _should_intervene(self, val_acc_history, val_loss_history):
+        """
+        Determine if intervention is needed based on performance trends.
+        
+        Args:
+            val_acc_history & val_loss_history: Lists containing metrics history
+            
+        Returns:
+            bool: True if intervention is needed, False otherwise
+        """
+        if val_acc_history is None or val_loss_history is None:
+            return False
+        
+        if len(val_acc_history) < 3 or len(val_loss_history) < 3:
+            return False
+        
+        # Check for decreasing accuracy trend
+        if val_acc_history[-1] < val_acc_history[-2] < val_acc_history[-3]:
+            logger.info("Intervention trigger: decreasing accuracy trend")
+            return True
+            
+        # Check for increasing loss trend
+        if val_loss_history[-1] > val_loss_history[-2] > val_loss_history[-3]:
+            logger.info("Intervention trigger: increasing loss trend")
+            return True
+            
+        # Check for plateauing accuracy (5 epochs with less than 0.5% improvement)
+        if len(val_acc_history) >= 5:
+            recent_accs = val_acc_history[-5:]
+            if max(recent_accs) - min(recent_accs) < 0.005:
+                logger.info("Intervention trigger: plateauing accuracy")
+                return True
+        
+        return False
+    
+    def learn_from_intervention(self, new_observation, reward):
+        """
+        Train the RL agent on a single step from the last intervention.
+        
+        Args:
+            new_observation: New state observation after applying hyperparameter changes
+            reward: Reward value indicating the success of the intervention
+            
+        Returns:
+            bool: Success status
+        """
+        if self.last_observation is None or self.last_action is None:
+            logger.warning("Cannot train RL agent: no previous action stored")
+            return False
+        
+        try:
+            # Log the received reward for monitoring purposes
+            logger.info(f"Received reward {reward:.4f} for intervention")
+            
+            # For on-policy algorithms like PPO, we cannot directly add experiences to a replay buffer
+            # Instead, we'll accumulate information about the quality of actions
+            # and periodically trigger a proper learn() call
+            
+            # Store this as a successful/unsuccessful intervention
+            self.training_step += 1
+            
+            # Update the environment's state if applicable
+            if hasattr(self.env, 'update_state'):
+                self.env.update_state(new_observation)
+            
+            # Periodically train the agent with collected experiences
+            if self.training_step % self.config.get('train_frequency', 10) == 0:
+                logger.info(f"Training PPO agent at step {self.training_step}")
+                
+                # Train for a small number of timesteps to avoid overfitting
+                # This will use the environment to collect experiences internally
+                self.agent.learn(
+                    total_timesteps=self.config.get('training_timesteps', 1000),
+                    callback=self.eval_callback,
+                    reset_num_timesteps=False
+                )
+            
+            logger.info(f"RL agent updated after intervention with reward: {reward:.4f}")
+            return True
+        
+        except Exception as e:
+            logger.error(f"Error during RL agent training: {str(e)}")
+            return False
+    
+    def save_brain(self, filepath=None):
+        """
+        Save the RL agent's brain to the specified file path.
+        
+        Args:
+            filepath (str): Path where the brain should be saved, or None for default path
+        """
+        try:
+            # If no filepath is provided, use default with timestamp
+            if filepath is None:
+                import time
+                timestamp = int(time.time())
+                filepath = os.path.join(self.brain_save_dir, f"rl_brain_{timestamp}.zip")
+            
+            # Create directory if needed
+            os.makedirs(os.path.dirname(filepath), exist_ok=True)
+            
+            self.agent.save(filepath)
+            logger.info(f"RL agent's brain saved to {filepath}")
+            return filepath
+        except Exception as e:
+            logger.error(f"Error saving RL agent's brain: {str(e)}")
+            return None
+    
+    def load_brain(self, filepath):
+        """
+        Load the RL agent's brain from the specified file path.
+        
+        Args:
+            filepath (str): Path to the saved brain
+            
+        Returns:
+            bool: Success status
+        """
+        try:
+            if not os.path.exists(filepath):
+                logger.error(f"Brain file not found: {filepath}")
+                return False
+                
+            self.agent = PPO.load(filepath, env=self.env)
+            logger.info(f"RL agent's brain loaded from {filepath}")
+            return True
+        except Exception as e:
+            logger.error(f"Error loading RL agent's brain: {str(e)}")
+            return False
+
     def why_intervene(self, val_acc_history, val_loss_history):
         """
         Determine why intervention is needed based on performance trends.
@@ -174,49 +293,3 @@ class HyperParameterOptimizer:
                 logged = True
         if not logged:
             logger.info("-we have to")
-    
-class OfflineHPOptimizer:
-    """
-    Offline hyperparameter optimizer that pre-trains an RL agent.
-    """
-    
-    def __init__(self, env, config):
-        """
-        Initialize the optimizer with environment and configuration.
-        
-        Args:
-            env: Hyperparameter optimization environment
-            config: Configuration dictionary
-        """
-        self.env = env
-        self.config = config
-        self.optimizer = HyperParameterOptimizer(env, config)
-        
-    def train_offline(self, episodes=50):
-        """
-        Train the RL agent offline with simulated data.
-        
-        Args:
-            episodes: Number of episodes to train
-            
-        Returns:
-            dict: Training results summary
-        """
-        logger.info(f"Starting offline training for {episodes} episodes")
-        
-        total_timesteps = episodes * self.config.get('max_steps_per_episode', 5)
-        self.optimizer.train(total_timesteps=total_timesteps)
-        
-        # Test the trained agent
-        observation, _ = self.env.reset()
-        action, _ = self.optimizer.agent.predict(observation.reshape(1, -1))
-        hyperparams = self.env.action_to_hp_dict(action[0])
-        
-        logger.info(f"Offline training completed. Sample hyperparameters: {hyperparams}")
-        
-        return {
-            'episodes': episodes,
-            'total_timesteps': total_timesteps,
-            'best_reward': self.optimizer.eval_callback.best_mean_reward,
-            'final_hyperparams': hyperparams
-        }

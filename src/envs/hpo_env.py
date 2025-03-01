@@ -283,7 +283,6 @@ class HPOEnvironment(gym.Env):
         # Prevent negative rewards
         return max(0, reward)
 
-    
     def reset(self, seed: Optional[int] = None, options: Optional[dict] = None) -> Tuple[np.ndarray, Dict[str, Any]]:
         """
         Reset the environment to start a new episode.

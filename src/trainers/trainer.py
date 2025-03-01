@@ -10,7 +10,6 @@ from tqdm import tqdm
 import matplotlib.pyplot as plt
 from typing import Dict, List, Any, Optional, Union, Tuple
 import wandb
-from collections import deque
 
 logger = logging.getLogger(__name__)
 
@@ -34,19 +33,17 @@ class ModelTrainer:
         """
         self.cnn_trainer = cnn_trainer
         self.rl_optimizer = rl_optimizer
-        self.config = config['training']
+        self.config = config
         
         # Get training parameters
-        self.max_epochs = self.config.get('max_epochs', 100)
-        self.early_stopping_patience = self.config.get('early_stopping_patience', 10)
-        self.eval_frequency = self.config.get('eval_frequency', 1)
-        self.checkpoint_frequency = self.config.get('checkpoint_frequency', 5)
-        
-        # Add save_freq attribute that matches checkpoint_frequency
-        self.save_freq = self.config.get('save_freq', self.checkpoint_frequency)
+        self.max_epochs = config.get('max_epochs', 100)
+        self.early_stopping_patience = config.get('early_stopping_patience', 10)
+        self.eval_frequency = config.get('eval_frequency', 1)
+        self.checkpoint_frequency = config.get('checkpoint_frequency', 5)
+        self.min_epochs_before_intervention = config.get('min_epochs_before_intervention', 5)
         
         # Setup logging
-        self.log_dir = config['logging'].get('log_dir', 'logs')
+        self.log_dir = config.get('log_dir', 'logs')
         os.makedirs(self.log_dir, exist_ok=True)
         self.checkpoint_dir = os.path.join(self.log_dir, 'checkpoints')
         os.makedirs(self.checkpoint_dir, exist_ok=True)
@@ -66,7 +63,7 @@ class ModelTrainer:
         
         # Training state
         self.current_epoch = 0
-        self.best_val_accuracy = 0.0
+        self.best_val_acc = 0.0
         self.best_val_loss = float('inf')
         self.epochs_without_improvement = 0
         self.training_interrupted = False
@@ -76,123 +73,184 @@ class ModelTrainer:
         # Initialize history file paths
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.history_file = os.path.join(self.log_dir, f"training_history_{timestamp}.json")
+        # Also save a copy to a fixed location for easy access
+        self.fixed_history_file = os.path.join(self.log_dir, "training_history.json")
+        
+        # Setup signal handling for graceful termination
+        self._setup_signal_handling()
         
         # Initialize wandb
-        self.use_wandb = self.config.get('use_wandb', True)
-        self.wandb_initialized = False
-
-        # Extract RL intervention settings
-        self.min_epochs_before_intervention = self.config.get("min_epochs_before_intervention", 5)
-        self.intervention_frequency = self.config.get("intervention_frequency", 3)
-        self.stagnation_threshold = self.config.get("stagnation_threshold", 0.005)
+        self.use_wandb = config.get('use_wandb', True)
+        self.wandb_initialized = True
         
+        # Create RL brain directory
+        self.rl_brain_dir = os.path.join(self.log_dir, 'rl_brains')
+        os.makedirs(self.rl_brain_dir, exist_ok=True)
 
-    def train(self, epochs=None, steps=None):
+
+    def train(self, epochs: Optional[int] = None) -> Dict[str, List]:
         """
-        Run the training loop with RL-based hyperparameter optimization.
+        Main training loop with RL interventions.
         
         Args:
-            epochs (int, optional): Number of epochs to train for. If None, uses the
-                                   value from config or defaults to class attribute.
-            steps (int, optional): Number of steps per epoch. If None, uses all data.
-                                  
+            epochs: Number of epochs to train (overrides config value if provided)
+            
         Returns:
-            dict: Training history metrics
+            dict: Training history
         """
-        logger.info("Starting training with RL-based hyperparameter optimization.")
-        self.training_start_time = time.time()
-        
-        # Set max_epochs from passed parameter if provided
         if epochs is not None:
             self.max_epochs = epochs
-            logger.info(f"Using provided epochs value: {self.max_epochs}")
+            
+        # Initialize wandb before training starts
+        if self.use_wandb and not self.wandb_initialized:
+            self._init_wandb()
         
-        # Main training loop
-        for epoch in range(1, self.max_epochs + 1):
-            self.current_epoch = epoch
-            epoch_start_time = time.time()
+        # Track pre-intervention metrics
+        self.last_intervention_metrics = None
             
-            # Train for one epoch
-            logger.info(f"Epoch {epoch}/{self.max_epochs}")
-            train_metrics = self._train_epoch()
+        try:
+            self.start_time = time.time()
+            logger.info(f"Starting training for {self.max_epochs} epochs")
             
-            # Evaluate on validation set
-            val_metrics = self.cnn_trainer.evaluate()
+            # Initial hyperparameters
+            initial_hyperparams = self._get_current_hyperparams()
+            self.history['hyperparameters'].append(initial_hyperparams)
             
-            # Calculate epoch time
-            epoch_time = time.time() - epoch_start_time
+            # Main training loop
+            for epoch in range(self.current_epoch, self.max_epochs):
+                self.current_epoch = epoch
+                
+                # Train for one epoch
+                epoch_start_time = time.time()
+                train_metrics = self.cnn_trainer.train_epoch()
+                epoch_time = time.time() - epoch_start_time
+                
+                # Evaluate if needed
+                if (epoch + 1) % self.eval_frequency == 0:
+                    val_metrics = self.cnn_trainer.evaluate()
+                else:
+                    val_metrics = {'loss': None, 'accuracy': None}
+                
+                # Update history with metrics
+                self._update_history(epoch, train_metrics, val_metrics, epoch_time)
+                
+                # Check if validation metrics are available
+                if val_metrics['loss'] is not None:
+                    val_loss = val_metrics['loss']
+                    val_acc = val_metrics['accuracy']
+                    
+                    # Check for improvement
+                    improved = False
+                    if val_acc > self.best_val_acc:
+                        improved = True
+                        self.best_val_acc = val_acc
+                        self.best_val_loss = val_loss
+                        self.epochs_without_improvement = 0
+                        
+                        # Save best model
+                        self._save_best_model()
+                    else:
+                        self.epochs_without_improvement += 1
+                    
+                    # Log progress
+                    status_msg = (
+                        f"Epoch {epoch+1}/{self.max_epochs}: "
+                        f"train_loss={train_metrics['loss']:.4f}, "
+                        f"train_acc={train_metrics['accuracy']:.4f}, "
+                        f"val_loss={val_loss:.4f}, "
+                        f"val_acc={val_acc:.4f}, "
+                        f"time={epoch_time:.1f}s"
+                    )
+                    if improved:
+                        status_msg += " (improved)"
+                    logger.info(status_msg)
+                    
+                    # Check for early stopping
+                    if self.epochs_without_improvement >= self.early_stopping_patience:
+                        logger.info(f"Early stopping triggered after {epoch+1} epochs")
+                        break
+                    
+                    # Log to wandb
+                    self._log_to_wandb(epoch, train_metrics, val_metrics, epoch_time)
+                    
+                    # Store current metrics before potential intervention
+                    pre_intervention_metrics = {
+                        'val_acc': val_acc,
+                        'val_loss': val_loss
+                    }
+                    
+                    # Check if RL intervention is needed
+                    if self._check_for_intervention():
+                        # Store pre-intervention metrics for reward calculation
+                        self.last_intervention_metrics = pre_intervention_metrics
+                else:
+                    # Log progress without validation metrics
+                    logger.info(
+                        f"Epoch {epoch+1}/{self.max_epochs}: "
+                        f"train_loss={train_metrics['loss']:.4f}, "
+                        f"train_acc={train_metrics['accuracy']:.4f}, "
+                        f"time={epoch_time:.1f}s"
+                    )
+                    
+                    # Log to wandb (training only)
+                    self._log_to_wandb(epoch, train_metrics, None, epoch_time)
+                
+                # Save checkpoint if needed
+                if (epoch + 1) % self.checkpoint_frequency == 0:
+                    self._save_checkpoint()
+                
+                # Save history after each epoch
+                self._save_history()
+                
+                # Check if training should be interrupted
+                if self.training_interrupted:
+                    logger.info("Training interrupted by user")
+                    break
             
-            # Update history with this epoch's metrics
-            self._update_history(epoch, train_metrics, val_metrics, epoch_time)
-            
-            # Convert metrics to float before logging
-            train_loss = float(train_metrics['loss'])
-            train_acc = float(train_metrics['accuracy'])
-            val_loss = float(val_metrics['loss'])
-            val_acc = float(val_metrics['accuracy'])
-
-            # Log to console
-            logger.info(f"Epoch {epoch}/{self.max_epochs} - "
-                    f"train_loss: {train_loss:.4f}, "
-                    f"train_acc: {train_acc:.4f}, "
-                    f"val_loss: {val_loss:.4f}, "
-                    f"val_acc: {val_acc:.4f}, "
-                    f"time: {epoch_time:.2f}s")
-            
-            # Log to wandb
-            if self.use_wandb:
-                self._log_to_wandb(epoch, train_metrics, val_metrics, epoch_time)
-            
-            # Track best model
-            if val_acc > self.best_val_accuracy:
-                self.best_val_accuracy = val_acc
-                self.epochs_without_improvement = 0
-                self._save_best_model()
-                self.best_val_loss = val_loss
-            else:
-                self.epochs_without_improvement += 1
-            
-            # Check for early stopping
-            if self.epochs_without_improvement >= self.early_stopping_patience:
-                logger.info(f"Early stopping triggered after {epoch} epochs without improvement")
-                break
-            
-            # Check for RL-based hyperparameter intervention
-            if self._should_intervene():
-                self._check_for_intervention()
-            
-            # Save checkpoint if needed
-            if epoch % self.checkpoint_frequency == 0:
-                self._save_checkpoint(epoch)
-            
-            # Save history after each epoch
+            # Final checkpoint and cleanup
+            self._save_checkpoint()
             self._save_history()
+            self._plot_training_history()
             
-            # Check for interruption
-            if self.training_interrupted:
-                logger.info("Training interrupted by user")
-                break
-        
-        # Save final model
-        self._save_checkpoint(epoch, is_final=True)
-        
-        # Log training summary
-        self._log_training_summary()
-
-        # Plot training history
-        self._plot_training_history()
-        
-        return self.history
-
-    def _log_training_summary(self):
-        """Log a summary of the training process."""
-        logger.info("Training Summary:")
-        logger.info(f"Total epochs: {self.current_epoch}")
-        logger.info(f"Best validation accuracy: {self.best_val_accuracy:.4f}")
-        logger.info(f"Best validation loss: {self.best_val_loss:.4f}")
-        logger.info(f"Total RL interventions: {len(self.history['rl_interventions'])}")
-        logger.info(f"Training interrupted: {self.training_interrupted}")
-        logger.info(f"Early stopping triggered: {self.epochs_without_improvement >= self.early_stopping_patience}")
+            total_time = time.time() - self.start_time
+            logger.info(f"Training completed in {total_time:.1f}s")
+            
+            # Log final summary to wandb
+            if self.wandb_initialized:
+                wandb.log({
+                    "best_val_acc": self.best_val_acc,
+                    "best_val_loss": self.best_val_loss,
+                    "final_epoch": self.current_epoch + 1,
+                    "total_training_time": total_time,
+                    "rl_interventions_count": len(self.history['rl_interventions'])
+                })
+                
+                # Save the final history plot to wandb
+                if os.path.exists(os.path.join(self.log_dir, 'training_history.png')):
+                    wandb.log({"training_history_plot": wandb.Image(
+                        os.path.join(self.log_dir, 'training_history.png'),
+                        caption="Training History"
+                    )})
+            
+            # Final save of RL brain at the end of training
+            brain_final_path = os.path.join(
+                self.log_dir, 
+                'rl_brains', 
+                f'brain_final.zip'
+            )
+            os.makedirs(os.path.dirname(brain_final_path), exist_ok=True)
+            self.rl_optimizer.save_brain(brain_final_path)
+            logger.info(f"Final RL brain saved to {brain_final_path}")
+            
+            return self.history
+            
+        except Exception as e:
+            logger.error(f"Error during training: {str(e)}")
+            self._save_history()  # Save history even on error
+            raise
+        finally:
+            # Ensure we save history on any exit
+            self._cleanup()
 
     def _log_to_wandb(self, epoch: int, train_metrics: Dict[str, float], 
                      val_metrics: Optional[Dict[str, float]], epoch_time: float) -> None:
@@ -236,7 +294,7 @@ class ModelTrainer:
             metrics.update({
                 "training/progress": (epoch + 1) / self.max_epochs,
                 "training/epochs_without_improvement": self.epochs_without_improvement,
-                "training/best_val_accuracy": self.best_val_accuracy,
+                "training/best_val_acc": self.best_val_acc,
             })
             
             # Log to wandb
@@ -245,27 +303,6 @@ class ModelTrainer:
         except Exception as e:
             logger.warning(f"Failed to log to Weights & Biases: {str(e)}")
 
-    def _train_epoch(self) -> Dict[str, float]:
-        """
-        Train for a single epoch.
-        
-        Returns:
-            dict: Training metrics for this epoch
-        """
-        try:
-            # Delegate to CNN trainer
-            train_loss, train_acc = self.cnn_trainer.train_epoch().values()
-            
-            return {
-                'loss': train_loss,
-                'accuracy': train_acc
-            }
-        except Exception as e:
-            logger.error(f"Error in epoch {self.current_epoch+1}: {str(e)}")
-            # Save state before propagating error
-            self._save_history()
-            raise
-
     def _check_for_intervention(self) -> bool:
         """
         Check if RL agent should intervene and apply hyperparameter changes.
@@ -273,10 +310,17 @@ class ModelTrainer:
         Returns:
             bool: True if intervention occurred, False otherwise
         """
+        # Only consider intervention after minimum number of epochs
+        if self.current_epoch < self.min_epochs_before_intervention:
+            return False
             
         # Get validation history for RL agent
         val_acc_history = self.history['val_acc']
         val_loss_history = self.history['val_loss']
+        
+        # Skip if we don't have enough history
+        if len(val_acc_history) < self.min_epochs_before_intervention:
+            return False
             
         # Prepare observation for RL agent
         observation = self._prepare_observation()
@@ -293,6 +337,10 @@ class ModelTrainer:
         # Apply new hyperparameters
         logger.info(f"RL agent intervening at epoch {self.current_epoch+1}")
         logger.info(f"New hyperparameters: {new_hyperparams}")
+        
+        # Store pre-intervention metrics for calculating reward later
+        pre_intervention_val_acc = val_acc_history[-1]
+        pre_intervention_val_loss = val_loss_history[-1]
         
         # Update model with new hyperparameters
         self.cnn_trainer.model.update_hyperparams(new_hyperparams)
@@ -318,7 +366,7 @@ class ModelTrainer:
                 wandb.log({
                     "rl_intervention": True,
                     "rl_intervention_epoch": self.current_epoch + 1,
-                    "val_acc_before_intervention": self.history['val_acc'][-1]
+                    "val_acc_before_intervention": val_acc_history[-1]
                 }, step=self.current_epoch + 1)
                 
                 # Log the hyperparameter changes
@@ -335,6 +383,57 @@ class ModelTrainer:
                 logger.warning(f"Failed to log RL intervention to Weights & Biases: {str(e)}")
         
         return True
+
+    def _provide_rl_reward_after_training(self, pre_val_acc, pre_val_loss):
+        """
+        Calculate reward for RL agent and make it learn based on the intervention outcome.
+        
+        Args:
+            pre_val_acc: Validation accuracy before intervention
+            pre_val_loss: Validation loss before intervention
+        """
+        # Skip if we don't have recent validation metrics
+        if not self.history['val_acc'] or not self.history['val_loss']:
+            return
+            
+        # Get current metrics
+        current_val_acc = self.history['val_acc'][-1]
+        current_val_loss = self.history['val_loss'][-1]
+        
+        # Calculate reward
+        # Reward improvement in accuracy and reduction in loss
+        acc_improvement = current_val_acc - pre_val_acc
+        loss_improvement = pre_val_loss - current_val_loss
+        
+        # Combine improvements into a reward
+        # Weight accuracy improvement higher
+        reward = acc_improvement * 10.0 + loss_improvement * 5.0
+        
+        # Ensure reward is not negative (minimum 0.1 to prevent discouraging exploration)
+        reward = max(0.1, reward)
+        
+        logger.info(f"RL reward: {reward:.4f} (acc: {current_val_acc:.4f} vs {pre_val_acc:.4f}, "
+                    f"loss: {current_val_loss:.4f} vs {pre_val_loss:.4f})")
+        
+        # Create new observation after intervention
+        new_observation = self._prepare_observation()
+        
+        # Make RL agent learn from this intervention
+        self.rl_optimizer.learn_from_intervention(new_observation, reward)
+        
+        # Periodically save the RL brain (e.g., every 5 interventions)
+        interventions_count = len(self.history['rl_interventions'])
+        save_frequency = self.config.get('rl_brain_save_frequency', 5)
+        
+        if interventions_count > 0 and interventions_count % save_frequency == 0:
+            brain_path = os.path.join(
+                self.log_dir, 
+                'rl_brains', 
+                f'brain_after_{interventions_count}_interventions.zip'
+            )
+            os.makedirs(os.path.dirname(brain_path), exist_ok=True)
+            self.rl_optimizer.save_brain(brain_path)
+            logger.info(f"RL brain saved after {interventions_count} interventions")
 
     def _prepare_observation(self) -> np.ndarray:
         """
@@ -354,7 +453,7 @@ class ModelTrainer:
             observation[3] = min(1.0, max(0.0, 1.0 - self.history['train_loss'][-1] / 10))  # Normalized train loss
             
         # Best performance so far
-        observation[4] = self.best_val_accuracy  # Best validation accuracy
+        observation[4] = self.best_val_acc  # Best validation accuracy
         observation[5] = min(1.0, max(0.0, 1.0 - self.best_val_loss / 10))  # Normalized best val loss
         
         # Current hyperparameters (normalized)
@@ -415,7 +514,7 @@ class ModelTrainer:
             }
 
     def _update_history(self, epoch: int, train_metrics: Dict[str, float], 
-                        val_metrics: Dict[str, float], epoch_time: float) -> None:
+                        val_metrics: Union[Dict[str, float], Tuple[float, float]], epoch_time: float) -> None:
         """
         Update training history with latest metrics.
         
@@ -425,12 +524,23 @@ class ModelTrainer:
             val_metrics: Validation metrics dict or tuple
             epoch_time: Time taken for this epoch
         """
-        # Update epoch history with latest metrics
-        train_loss = train_metrics.get('loss', 0)
-        train_acc = train_metrics.get('accuracy', 0)
-        val_loss = val_metrics.get('loss', 0)
-        val_acc = val_metrics.get('accuracy', 0)
-        
+        # Handle train metrics (which could be tuple or dict)
+        if isinstance(train_metrics, tuple):
+            train_loss, train_acc = train_metrics
+        elif isinstance(train_metrics, dict):
+            train_loss = train_metrics.get('loss', 0)
+            train_acc = train_metrics.get('accuracy', 0)
+        else:
+            train_loss, train_acc = 0, 0
+            
+        # Handle validation metrics (which could be tuple or dict)
+        if isinstance(val_metrics, tuple):
+            val_loss, val_acc = val_metrics
+        elif isinstance(val_metrics, dict):
+            val_loss = val_metrics.get('loss', 0)
+            val_acc = val_metrics.get('accuracy', 0)
+        else:
+            val_loss, val_acc = 0, 0
             
         # Update history
         self.history['train_loss'].append(train_loss)
@@ -439,6 +549,17 @@ class ModelTrainer:
         self.history['val_acc'].append(val_acc)
         self.history['time_per_epoch'].append(epoch_time)
         self.history['timestamp'].append(datetime.now().isoformat())
+        
+        # Check if there was a recent intervention (within the last epoch)
+        if (hasattr(self, 'last_intervention_metrics') and 
+            self.last_intervention_metrics is not None):
+            # Calculate reward and provide feedback to RL agent
+            self._provide_rl_reward_after_training(
+                self.last_intervention_metrics['val_acc'],
+                self.last_intervention_metrics['val_loss']
+            )
+            # Clear the last intervention metrics after providing reward
+            self.last_intervention_metrics = None
 
     def _save_history(self) -> None:
         """Save training history to JSON files."""
@@ -454,18 +575,23 @@ class ModelTrainer:
             # Save to timestamped file
             with open(self.history_file, 'w') as f:
                 json.dump(json_history, f, indent=2)
-            logger.debug(f"Training history saved to {self.history_file}")
+                
+            # Also save to fixed location for easy access
+            with open(self.fixed_history_file, 'w') as f:
+                json.dump(json_history, f, indent=2)
+                
+            logger.debug(f"Training history saved to {self.history_file} and {self.fixed_history_file}")
         except Exception as e:
             logger.error(f"Error saving history: {str(e)}")
 
-    def _save_checkpoint(self, epoch, is_final=False) -> None:
+    def _save_checkpoint(self) -> None:
         """Save training checkpoint."""
         try:
             checkpoint = {
                 'epoch': self.current_epoch,
                 'model_state_dict': self.cnn_trainer.model.state_dict(),
                 'optimizer_state_dict': self.cnn_trainer.optimizer.state_dict(),
-                'best_val_accuracy': self.best_val_accuracy,
+                'best_val_acc': self.best_val_acc,
                 'best_val_loss': self.best_val_loss,
                 'history': self.history,
                 'epochs_without_improvement': self.epochs_without_improvement,
@@ -491,12 +617,12 @@ class ModelTrainer:
                 'epoch': self.current_epoch,
                 'model_state_dict': self.cnn_trainer.model.state_dict(),
                 'optimizer_state_dict': self.cnn_trainer.optimizer.state_dict(),
-                'val_acc': self.best_val_accuracy,
+                'val_acc': self.best_val_acc,
                 'val_loss': self.best_val_loss,
                 'hyperparams': self._get_current_hyperparams()
             }, best_model_path)
             
-            logger.info(f"Best model saved at epoch {self.current_epoch+1} with val_acc={self.best_val_accuracy:.4f}")
+            logger.info(f"Best model saved at epoch {self.current_epoch+1} with val_acc={self.best_val_acc:.4f}")
         except Exception as e:
             logger.error(f"Error saving best model: {str(e)}")
 
@@ -516,7 +642,7 @@ class ModelTrainer:
             
             # Restore training state
             self.current_epoch = checkpoint['epoch'] + 1  # Resume from next epoch
-            self.best_val_accuracy = checkpoint['best_val_accuracy']
+            self.best_val_acc = checkpoint['best_val_acc']
             self.best_val_loss = checkpoint['best_val_loss']
             self.history = checkpoint['history']
             self.epochs_without_improvement = checkpoint['epochs_without_improvement']
@@ -603,6 +729,12 @@ class ModelTrainer:
         except Exception as e:
             logger.error(f"Error plotting training history: {str(e)}")
 
+    def _signal_handler(self, sig, frame):
+        """Handle termination signals gracefully."""
+        logger.info(f"Received signal {sig}, initiating graceful shutdown")
+        self.training_interrupted = True
+
+    def _setup_signal_handling(self):
         """Setup signal handlers for graceful termination."""
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
@@ -622,7 +754,7 @@ class ModelTrainer:
                 # Log final summary if we haven't already
                 wandb.log({
                     "final_epoch": self.current_epoch + 1,
-                    "best_val_accuracy": self.best_val_accuracy,
+                    "best_val_acc": self.best_val_acc,
                     "completed": not self.training_interrupted,
                     "early_stopped": self.epochs_without_improvement >= self.early_stopping_patience
                 })
@@ -636,38 +768,3 @@ class ModelTrainer:
                 logger.info("Weights & Biases run finished")
             except Exception as e:
                 logger.warning(f"Error finalizing wandb run: {str(e)}")
-
-    def _is_training_stagnated(self):
-        """Check if training progress has stagnated based on validation accuracy and loss"""
-        val_acc_history = self.history['val_acc']
-        val_loss_history = self.history['val_loss']
-        
-        if len(val_acc_history) < 4:
-            return False  # Not enough data to check stagnation
-        
-        # Compute accuracy improvement over last 3 epochs
-        acc_improvements = [val_acc_history[-i] - val_acc_history[-i-1] for i in range(1, 4)]
-        avg_acc_improvement = sum(acc_improvements) / len(acc_improvements)
-        
-        # Compute loss trend over last 3 epochs
-        loss_trend = val_loss_history[-1] - val_loss_history[-4]
-        
-        logger.info(f"Avg Acc Improvement: {avg_acc_improvement:.4f}, Loss Trend: {loss_trend:.4f}")
-
-        # Stagnation happens if accuracy improves too little AND loss isn't improving
-        return avg_acc_improvement < self.stagnation_threshold and loss_trend >= 0
-
-    
-    def _should_intervene(self):
-        """Determine if the RL agent should intervene in the training process"""
-        # No intervention before minimum number of epochs
-        if self.current_epoch < self.min_epochs_before_intervention:
-            logger.info(f"Skipping intervention before epoch {self.min_epochs_before_intervention}")
-            return False
-            
-        # Only check on epochs that are multiples of intervention_frequency after min_epochs
-        if (self.current_epoch - self.min_epochs_before_intervention) % self.intervention_frequency != 0:
-            return False
-            
-        # Check if training is stagnated
-        return self._is_training_stagnated()
