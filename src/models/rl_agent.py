@@ -1,6 +1,5 @@
 import os
 import numpy as np
-import torch
 import logging
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import BaseCallback
@@ -260,7 +259,7 @@ class HyperParameterOptimizer:
                 logger.error(f"Brain file not found: {filepath}")
                 return False
                 
-            self.agent = PPO.load(filepath, env=self.env)
+            self.agent = PPO.load(filepath, env=self.env, device="cpu")  # Force CPU usage when loading
             logger.info(f"RL agent's brain loaded from {filepath}")
             return True
         except Exception as e:

@@ -154,6 +154,11 @@ def init_wandb(args, config):
         project_name = args.wandb_project or wandb_config.get("project", "CNN-with-RL")
         run_name = args.wandb_name or wandb_config.get("run_name") or f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         
+        # Check if wandb is already initialized
+        if wandb.run is not None:
+            logger.info("WandB already initialized, using existing run")
+            return True
+            
         # Initialize wandb
         wandb.init(
             project=project_name,
@@ -162,6 +167,11 @@ def init_wandb(args, config):
             dir=args.output_dir
         )
         
+        # Double check that initialization worked
+        if wandb.run is None:
+            logger.warning("WandB initialization failed to create a run")
+            return False
+            
         logger.info(f"Initialized Weights & Biases: project='{project_name}', run='{run_name}'")
         return True
     except Exception as e:
@@ -285,7 +295,9 @@ def main():
         
         # Evaluate on test set
         logger.info("Evaluating on test set...")
-        test_loss, test_acc = cnn_trainer.evaluate(test_loader)
+        test_metrics = cnn_trainer.evaluate(test_loader)
+        test_loss = test_metrics.get('loss', 0)
+        test_acc = test_metrics.get('accuracy', 0)
         
         # Convert the values to float before formatting
         try:
@@ -301,7 +313,7 @@ def main():
         results_file = os.path.join(run_dir, "results.json")
         with open(results_file, "w") as f:
             json.dump({
-                "best_val_accuracy": trainer.best_val_accu,
+                "best_val_accuracy": trainer.best_val_acc,
                 "best_val_loss": trainer.best_val_loss,
                 "test_acc": test_acc,
                 "test_loss": test_loss,
@@ -319,40 +331,52 @@ def main():
         logger.info(f"Final RL brain saved to {final_brain_path}")
         
         # Finalize wandb
-        if wandb_initialized:
+        if wandb_initialized and wandb.run is not None:
             # Log final results
-            wandb.log({
-                "best_val_accuracy": trainer.best_val_accu,
-                "best_val_loss": trainer.best_val_loss,
-                "test_acc": test_acc,
-                "test_loss": test_loss,
-                "training_time": training_time,
-                "final_epoch": trainer.current_epoch + 1,
-            })
-            
-            # Save artifacts
-            best_model_path = os.path.join(log_dir, "best_model.pt")
-            if os.path.isfile(best_model_path):
-                model_artifact = wandb.Artifact(
-                    name=f"model_{wandb.run.id}",
-                    type="model",
-                    description="Trained CNN model with RL-optimized hyperparameters"
-                )
-                model_artifact.add_file(best_model_path)
-                wandb.log_artifact(model_artifact)
-            else:
-                logger.warning(f"Best model file not found: {best_model_path}")
-            
-            wandb.finish()
+            try:
+                wandb.log({
+                    "best_val_accuracy": trainer.best_val_acc,
+                    "best_val_loss": trainer.best_val_loss,
+                    "test_acc": test_acc,
+                    "test_loss": test_loss,
+                    "training_time": training_time,
+                    "final_epoch": trainer.current_epoch + 1,
+                })
+                
+                # Save artifacts
+                best_model_path = os.path.join(log_dir, "best_model.pt")
+                if os.path.isfile(best_model_path):
+                    model_artifact = wandb.Artifact(
+                        name=f"model_{wandb.run.id}",
+                        type="model",
+                        description="Trained CNN model with RL-optimized hyperparameters"
+                    )
+                    model_artifact.add_file(best_model_path)
+                    wandb.log_artifact(model_artifact)
+                else:
+                    logger.warning(f"Best model file not found: {best_model_path}")
+                
+                wandb.finish()
+            except Exception as wandb_error:
+                logger.warning(f"Error during WandB logging: {wandb_error}")
+                # Try to finish the run even if there was an error
+                try:
+                    if wandb.run is not None:
+                        wandb.finish(exit_code=1)
+                except:
+                    pass
         
         logger.info("Training completed successfully!")
         
     except Exception as e:
         logger.exception(f"Error during training: {e}")
-        if wandb_initialized and wandb.run:
+        if wandb_initialized and wandb.run is not None:
             # Log error and finish wandb run
-            wandb.log({"error": str(e)})
-            wandb.finish(exit_code=1)
+            try:
+                wandb.log({"error": str(e)})
+                wandb.finish(exit_code=1)
+            except:
+                pass
         raise
 
 if __name__ == "__main__":
