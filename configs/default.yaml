@@ -9,7 +9,7 @@ training:
   learning_rate: 0.001
   epochs: 30
   max_epochs: 100
-  early_stopping_patience: 15
+  early_stopping_patience: 25
   eval_frequency: 1
   checkpoint_frequency: 5
   min_epochs_before_intervention: 5

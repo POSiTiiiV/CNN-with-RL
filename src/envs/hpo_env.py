@@ -64,7 +64,7 @@ class HPOEnvironment(gym.Env):
         self.observation_space = spaces.Box(
             low=0.0, 
             high=1.0, 
-            shape=(15,),  # 15 features to track state
+            shape=(18,),  # 18 features to track state
             dtype=np.float32
         )
         
@@ -117,7 +117,7 @@ class HPOEnvironment(gym.Env):
         Returns:
             np.ndarray: The current state observation
         """
-        observation = np.zeros(15, dtype=np.float32)
+        observation = np.zeros(18, dtype=np.float32)
         
         # Current performance metrics
         if self.history['val_acc']:
@@ -419,3 +419,4 @@ class HPOEnvironment(gym.Env):
             
         print(f"Steps without improvement: {self.no_improvement_count}")
         print("="*50 + "\n")
+
