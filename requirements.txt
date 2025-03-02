@@ -12,3 +12,4 @@ gymnasium
 stable-baselines3
 wandb
 psutil
+PyYAML

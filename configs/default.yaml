@@ -26,6 +26,20 @@ rl:
   batch_size: 64  # Minibatch size for policy update
   n_epochs: 10  # Number of epochs when optimizing the surrogate loss
   gamma: 0.99  # Discount factor
+  gae_lambda: 0.95  # GAE lambda parameter
+  clip_range: 0.2  # PPO clipping parameter
+  normalize_advantage: true  # Whether to normalize advantages
+  brain_save_dir: "models/rl_brains"  # Directory to save RL models
+  # Intervention decision parameters
+  intervention_threshold: 0.4  # Threshold for deciding when to intervene (lower = less interventions)
+  ent_coef: 0.01  # Entropy coefficient to encourage exploration
+  # Dynamic training parameters
+  train_frequency_min: 5  # Minimum frequency for training updates
+  train_frequency_max: 25  # Maximum frequency for training updates 
+  training_timesteps_min: 5000  # Minimum timesteps per training update
+  training_timesteps_max: 10000  # Maximum timesteps per training update
+  # RL brain saving configuration
+  rl_brain_save_frequency: 5  # How often to save the brain (every N decisions)
   
 # Environment Configuration
 env:
