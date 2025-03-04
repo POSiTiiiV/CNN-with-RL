@@ -167,4 +167,6 @@ wandb/
 data/
 output/
 logs/
+training_history/
 test.py
+.idea/workspace.xml
