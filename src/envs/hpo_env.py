@@ -5,6 +5,7 @@ import math
 import copy
 from typing import Dict, List, Tuple, Optional, Any
 import logging
+from ..utils.utils import create_observation, enhance_observation_with_trends, calculate_performance_trends
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +31,10 @@ class HPOEnvironment(gym.Env):
         self.reward_scaling = config.get('reward_scaling', 10.0)
         self.exploration_bonus = config.get('exploration_bonus', 0.5)
         self.patience = config.get('patience', 3)
+        self.intervention_frequency = config.get('intervention_frequency', 5)
+        self.stagnation_epochs = 3  # If val_loss does not improve for 3 epochs, intervene
+        self.stagnation_threshold = 0.001  # Minimal change in val_loss to consider improvement
+
         
         # Initialize tracking variables
         self.current_step = 0
@@ -61,12 +66,10 @@ class HPOEnvironment(gym.Env):
         
         # Define the observation space
         # This includes normalized metrics and hyperparameter values
-        self.observation_space = spaces.Box(
-            low=0.0, 
-            high=1.0, 
-            shape=(18,),  # 18 features to track state
-            dtype=np.float32
-        )
+        self.observation_space = spaces.Dict({
+            'metrics': spaces.Box(low=0.0, high=1.0, shape=(14,), dtype=np.float32),  # 14 features to track state
+            'hyperparams': spaces.Box(low=0.0, high=1.0, shape=(4,), dtype=np.float32)  # 4 normalized hyperparameters
+        })
         
         # Create mapping from action indices to hyperparameter values
         self._create_action_mappings()
@@ -102,6 +105,8 @@ class HPOEnvironment(gym.Env):
 
     def action_to_hp_dict(self, action):
         """Convert MultiDiscrete action to hyperparameter dictionary"""
+        if isinstance(action, np.ndarray):
+            action = action.tolist()
         return {
             'learning_rate': float(self.lr_values[action[0]]),
             'dropout_rate': float(self.dropout_values[action[1]]),
@@ -110,112 +115,66 @@ class HPOEnvironment(gym.Env):
             'fc_config': self.fc_configs[action[4]]
         }
         
-    def _get_observation(self) -> np.ndarray:
+    def _get_observation(self) -> Dict[str, np.ndarray]:
         """
         Create an observation from the current state.
         
         Returns:
-            np.ndarray: The current state observation
+            Dict[str, np.ndarray]: The current state observation
         """
-        observation = np.zeros(18, dtype=np.float32)
-        
-        # Current performance metrics
-        if self.history['val_acc']:
-            observation[0] = self.history['val_acc'][-1]  # Current val accuracy
-            observation[1] = min(1.0, max(0.0, 1.0 - self.history['val_loss'][-1] / 10))  # Normalized val loss
-            observation[2] = self.history['train_acc'][-1] if self.history['train_acc'] else 0.0
-            observation[3] = min(1.0, max(0.0, 1.0 - self.history['train_loss'][-1] / 10))
-            
-        # Best performance so far
-        observation[4] = self.best_val_acc
-        observation[5] = min(1.0, max(0.0, 1.0 - self.best_val_loss / 10))
-        
-        # Current hyperparameters (normalized)
-        if self.current_hyperparams:
-            # Learning rate (log scale normalization)
-            lr = self.current_hyperparams.get('learning_rate', 0.001)
-            observation[6] = (np.log10(lr) + 5) / 3  # Log scale from 1e-5 to 1e-2
-            
-            # Weight decay (log scale normalization)
-            wd = self.current_hyperparams.get('weight_decay', 1e-4)
-            observation[7] = (np.log10(wd) + 6) / 4  # Log scale from 1e-6 to 1e-2
-            
-            # Dropout rate (linear scale)
-            observation[8] = self.current_hyperparams.get('dropout_rate', 0.5)
-            
-            # Optimizer type (one-hot like encoding)
-            opt_type = self.current_hyperparams.get('optimizer_type', 'adam')
-            if opt_type == 'adam':
-                observation[9] = 0.33
-            elif opt_type == 'sgd':
-                observation[10] = 0.33
-            else:  # adamw
-                observation[11] = 0.33
-        
-        # Episode progress
-        observation[12] = self.current_step / self.max_steps
-        
-        # No improvement counter (normalized)
-        observation[13] = self.no_improvement_count / self.patience
-        
-        # Relative improvement from last step
-        if len(self.history['val_acc']) > 1:
-            last_acc = self.history['val_acc'][-2]
-            current_acc = self.history['val_acc'][-1]
-            rel_improvement = (current_acc - last_acc) / max(0.01, last_acc)
-            observation[14] = min(1.0, max(0.0, rel_improvement + 0.5))  # Scale to [0,1]
-            
-        return observation
-        
-    def step(self, action) -> Tuple[np.ndarray, float, bool, bool, Dict[str, Any]]:
-        """
-        Take a step by applying hyperparameters and evaluating the model.
-        
-        Args:
-            action: Dictionary of actions from the RL agent
-            
-        Returns:
-            Tuple containing:
-                observation (np.ndarray): Current state
-                reward (float): Reward for the action
-                terminated (bool): Whether the episode is done
-                truncated (bool): Whether the episode was truncated
-                info (dict): Additional information
-        """
+        return create_observation({
+            'history': self.history,
+            'current_hyperparams': self.current_hyperparams,
+            'best_val_acc': self.best_val_acc,
+            'best_val_loss': self.best_val_loss,
+            'current_step': self.current_step,
+            'max_steps': self.max_steps,
+            'no_improvement_count': self.no_improvement_count,
+            'patience': self.patience
+        })
+
+    def step(self, action) -> Tuple[Dict[str, np.ndarray], float, bool, bool, Dict[str, Any]]:
         self.current_step += 1
-        
-        # Convert MultiDiscrete action to hyperparameter dictionary
-        self.current_hyperparams = self.action_to_hp_dict(action)
-        
-        # Create a config hash to track exploration
-        param_hash = self._get_param_hash(self.current_hyperparams)
-        is_new_config = param_hash not in self.explored_configs
-        self.explored_configs.add(param_hash)
-        
-        # Apply hyperparameters to the model
-        self.cnn_trainer.model.update_hyperparams(self.current_hyperparams)
-        
-        # Update optimizer with new hyperparameters
-        self.cnn_trainer.optimizer = self.cnn_trainer.model.get_optimizer()
-        
-        # Train for defined number of epochs
+
+        # Track last N validation losses to check stagnation
+        self.val_loss_history.append(self.history['val_loss'][-1] if self.history['val_loss'] else float('inf'))
+        if len(self.val_loss_history) > self.stagnation_epochs:
+            self.val_loss_history.popleft()
+
+        # Check if validation loss has stagnated (no significant improvement for N epochs)
+        stagnation_detected = len(self.val_loss_history) == self.stagnation_epochs and \
+                            max(self.val_loss_history) - min(self.val_loss_history) < self.stagnation_threshold
+
+        # RL should intervene **only if stagnation is detected**
+        if stagnation_detected:
+            self.current_hyperparams = self.action_to_hp_dict(action)
+            param_hash = self._get_param_hash(self.current_hyperparams)
+            is_new_config = param_hash not in self.explored_configs
+            self.explored_configs.add(param_hash)
+
+            # Apply new hyperparameters
+            self.cnn_trainer.model.update_hyperparams(self.current_hyperparams)
+            self.cnn_trainer.optimizer = self.cnn_trainer.model.get_optimizer()
+
+        # Train for multiple epochs before the next RL decision
         for _ in range(self.epochs_per_step):
             train_loss, train_acc = self.cnn_trainer.train_epoch().values()
-        
+
         # Evaluate on validation set
         val_loss, val_acc = self.cnn_trainer.evaluate().values()
-        
+
         # Update history
         self.history['val_acc'].append(val_acc)
         self.history['val_loss'].append(val_loss)
         self.history['train_acc'].append(train_acc)
         self.history['train_loss'].append(train_loss)
-        self.history['hyperparams'].append(copy.deepcopy(self.current_hyperparams))
-        
+        if stagnation_detected:
+            self.history['hyperparams'].append(copy.deepcopy(self.current_hyperparams))
+
         # Calculate reward
         reward = self._calculate_reward(val_acc, val_loss, is_new_config)
         self.history['rewards'].append(reward)
-        
+
         # Check for improvement
         improved = False
         if val_acc > self.best_val_acc:
@@ -226,13 +185,22 @@ class HPOEnvironment(gym.Env):
             improved = True
         else:
             self.no_improvement_count += 1
-        
+
         # Check if episode is done
         done = (self.current_step >= self.max_steps) or (self.no_improvement_count >= self.patience)
-        
+
         # Get next observation
         observation = self._get_observation()
-        
+
+        # Add trend data to observation
+        trend_data = calculate_performance_trends({
+            'history': self.history,
+            'metric_window_size': self.config.get('metric_window_size', 5),
+            'improvement_threshold': self.config.get('improvement_threshold', 0.002),
+            'loss_stagnation_threshold': self.config.get('loss_stagnation_threshold', 0.003)
+        })
+        observation = enhance_observation_with_trends(observation, trend_data)
+
         # Create info dictionary
         info = {
             'val_acc': val_acc,
@@ -245,15 +213,15 @@ class HPOEnvironment(gym.Env):
             'best_hyperparams': self.best_hyperparams,
             'improved': improved,
             'steps_without_improvement': self.no_improvement_count,
-            'is_new_config': is_new_config
+            'is_new_config': is_new_config,
+            'stagnation_detected': stagnation_detected
         }
-        
-        # Render if needed
+
         if self.render_mode == 'human':
             self.render()
-            
+
         return observation, reward, done, False, info
-        
+
     def _calculate_reward(self, val_acc: float, val_loss: float, is_new_config: bool) -> float:
         """
         Calculate reward based on validation metrics.
@@ -266,16 +234,22 @@ class HPOEnvironment(gym.Env):
         Returns:
             float: The reward value
         """
+        # Base reward is a combination of validation accuracy and loss
         reward = math.log(1 + val_acc) - 0.1 * val_loss  
 
-        # Bonus for improvement
+        # Bonus for improvement in validation accuracy
         if val_acc > self.best_val_acc:
             improvement = val_acc - self.best_val_acc
             reward += self.reward_scaling * improvement
 
-        # Exploration bonus
+        # Bonus for improvement in validation loss
+        if val_loss < self.best_val_loss:
+            loss_improvement = self.best_val_loss - val_loss
+            reward += self.reward_scaling * loss_improvement
+
+        # Exploration bonus (less weight compared to improvements)
         if is_new_config:
-            reward += self.exploration_bonus
+            reward += 0.1 * self.exploration_bonus
 
         # Penalty for no improvement
         reward -= 0.1 * self.no_improvement_count
@@ -283,7 +257,7 @@ class HPOEnvironment(gym.Env):
         # Prevent negative rewards
         return max(0, reward)
 
-    def reset(self, seed: Optional[int] = None, options: Optional[dict] = None) -> Tuple[np.ndarray, Dict[str, Any]]:
+    def reset(self, seed: Optional[int] = None, options: Optional[dict] = None) -> Tuple[Dict[str, np.ndarray], Dict[str, Any]]:
         """
         Reset the environment to start a new episode.
         
@@ -293,7 +267,7 @@ class HPOEnvironment(gym.Env):
             
         Returns:
             Tuple containing:
-                observation (np.ndarray): Initial observation
+                observation (Dict[str, np.ndarray]): Initial observation
                 info (dict): Additional information
         """
         super().reset(seed=seed)
@@ -369,7 +343,7 @@ class HPOEnvironment(gym.Env):
         }
         
         return observation, info
-        
+     
     def _get_param_hash(self, hyperparams: Dict[str, Any]) -> str:
         """
         Create a hash string for a hyperparameter configuration to track explored configs.
@@ -388,7 +362,7 @@ class HPOEnvironment(gym.Env):
         opt = hyperparams.get('optimizer_type', '')
         
         return f"lr{lr}_wd{wd}_dr{dr}_fc{fc}_opt{opt}"
-        
+      
     def render(self):
         """
         Render the current state of the environment.
@@ -419,4 +393,3 @@ class HPOEnvironment(gym.Env):
             
         print(f"Steps without improvement: {self.no_improvement_count}")
         print("="*50 + "\n")
-

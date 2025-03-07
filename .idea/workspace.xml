@@ -5,10 +5,14 @@
   </component>
   <component name="ChangeListManager">
     <list default="true" id="6078214f-6c3f-4ecc-8746-ae8ddb253b55" name="Changes" comment="">
-      <change beforePath="$PROJECT_DIR$/balanced_full_df.csv" beforeDir="false" afterPath="$PROJECT_DIR$/balanced_full_df.csv" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/merged_images.zip" beforeDir="false" afterPath="$PROJECT_DIR$/merged_images.zip" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/minorProject.ipynb" beforeDir="false" afterPath="$PROJECT_DIR$/minorProject.ipynb" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/testing.ipynb" beforeDir="false" afterPath="$PROJECT_DIR$/testing.ipynb" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/configs/default.yaml" beforeDir="false" afterPath="$PROJECT_DIR$/configs/default.yaml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/models/rl_brains/best_rl_brain.zip" beforeDir="false" afterPath="$PROJECT_DIR$/models/rl_brains/best_rl_brain.zip" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/models/rl_brains/best_rl_brain_metadata.json" beforeDir="false" afterPath="$PROJECT_DIR$/models/rl_brains/best_rl_brain_metadata.json" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/envs/hpo_env.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/envs/hpo_env.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/models/rl_agent.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/models/rl_agent.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/trainers/cnn_trainer.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/trainers/cnn_trainer.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/trainers/trainer.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/trainers/trainer.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -40,9 +44,10 @@
   </component>
   <component name="PropertiesComponent"><![CDATA[{
   "keyToString": {
+    "Python.main.executor": "Debug",
     "RunOnceActivity.ShowReadmeOnStart": "true",
     "RunOnceActivity.git.unshallow": "true",
-    "git-widget-placeholder": "testing",
+    "git-widget-placeholder": "ubuntu",
     "ignore.virus.scanning.warn.message": "true",
     "last_opened_file_path": "C:/Users/gokus/PycharmProjects/pythonProject",
     "node.js.detected.package.eslint": "true",
@@ -50,15 +55,15 @@
     "node.js.selected.package.eslint": "(autodetect)",
     "node.js.selected.package.tslint": "(autodetect)",
     "nodejs_package_manager_path": "npm",
-    "settings.editor.selected.configurable": "ml.llm.LLMConfigurable",
+    "settings.editor.selected.configurable": "com.jetbrains.python.configuration.PyActiveSdkModuleConfigurable",
     "vue.rearranger.settings.migration": "true"
   }
 }]]></component>
   <component name="SharedIndexes">
     <attachedChunks>
       <set>
-        <option value="bundled-js-predefined-d6986cc7102b-deb605915726-JavaScript-PY-243.22562.220" />
-        <option value="bundled-python-sdk-0fc6c617c4bd-9a18a617cbe4-com.jetbrains.pycharm.pro.sharedIndexes.bundled-PY-243.22562.220" />
+        <option value="bundled-js-predefined-d6986cc7102b-1632447f56bf-JavaScript-PY-243.25659.43" />
+        <option value="bundled-python-sdk-181015f7ab06-4df51de95216-com.jetbrains.pycharm.pro.sharedIndexes.bundled-PY-243.25659.43" />
       </set>
     </attachedChunks>
   </component>
@@ -77,10 +82,50 @@
       <workItem from="1735296272029" duration="409000" />
       <workItem from="1735296845966" duration="487000" />
       <workItem from="1735297348466" duration="402000" />
+      <workItem from="1741063820491" duration="2728000" />
     </task>
     <servers />
   </component>
   <component name="TypeScriptGeneratedFilesManager">
     <option name="version" value="3" />
+  </component>
+  <component name="XDebuggerManager">
+    <breakpoint-manager>
+      <breakpoints>
+        <line-breakpoint enabled="true" suspend="THREAD" type="python-line">
+          <url>file://$PROJECT_DIR$/src/models/rl_agent.py</url>
+          <line>187</line>
+          <option name="timeStamp" value="3" />
+        </line-breakpoint>
+        <line-breakpoint enabled="true" suspend="THREAD" type="python-line">
+          <url>file://$PROJECT_DIR$/src/models/rl_agent.py</url>
+          <line>378</line>
+          <option name="timeStamp" value="4" />
+        </line-breakpoint>
+        <line-breakpoint enabled="true" suspend="THREAD" type="python-line">
+          <url>file://$PROJECT_DIR$/src/models/rl_agent.py</url>
+          <line>161</line>
+          <option name="timeStamp" value="5" />
+        </line-breakpoint>
+        <line-breakpoint enabled="true" suspend="THREAD" type="python-line">
+          <url>file://$PROJECT_DIR$/src/models/rl_agent.py</url>
+          <line>280</line>
+          <option name="timeStamp" value="6" />
+        </line-breakpoint>
+        <line-breakpoint enabled="true" suspend="THREAD" type="python-line">
+          <url>file://$PROJECT_DIR$/src/models/rl_agent.py</url>
+          <line>93</line>
+          <option name="timeStamp" value="7" />
+        </line-breakpoint>
+      </breakpoints>
+    </breakpoint-manager>
+    <watches-manager>
+      <configuration name="PythonConfigurationType">
+        <watch expression="self.training_timesteps" language="Python" />
+      </configuration>
+    </watches-manager>
+  </component>
+  <component name="com.intellij.coverage.CoverageDataManagerImpl">
+    <SUITE FILE_PATH="coverage/CNN_with_RL$main.coverage" NAME="main Coverage Results" MODIFIED="1741066450635" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$" />
   </component>
 </project>

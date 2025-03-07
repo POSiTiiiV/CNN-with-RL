@@ -32,7 +32,7 @@ GLOBAL_IMAGE_CACHE = {}
 def is_memory_critical():
     """Check if system memory is critically low"""
     return psutil.virtual_memory().available < 1 * 1024 * 1024 * 1024  # 1GB threshold
-
+# TODO: is it using the GPU or not?
 class OptimizedFundusDataset(Dataset):
     def __init__(self, df, images_dir, transform=None, cache_images=True, cache_tensors=True, 
                  use_global_cache=True, dataset_type=""):

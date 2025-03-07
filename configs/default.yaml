@@ -9,11 +9,10 @@ training:
   learning_rate: 0.001
   epochs: 30
   max_epochs: 100
-  early_stopping_patience: 25
-  eval_frequency: 1
+  early_stopping_patience: 35
   checkpoint_frequency: 5
   min_epochs_before_intervention: 5
-  intervention_frequency: 3
+  intervention_frequency: 5
   stagnation_threshold: 0.005
   
 # Reinforcement Learning Configuration
@@ -36,8 +35,10 @@ rl:
   # Dynamic training parameters
   train_frequency_min: 5  # Minimum frequency for training updates
   train_frequency_max: 25  # Maximum frequency for training updates 
-  training_timesteps_min: 5000  # Minimum timesteps per training update
+  training_timesteps_min: 500  # Minimum timesteps per training update
   training_timesteps_max: 10000  # Maximum timesteps per training update
+  min_results_for_training: 5  # Minimum frequency for training updates
+  max_results_for_training: 25  # Maximum frequency for training updates
   # RL brain saving configuration
   rl_brain_save_frequency: 5  # How often to save the brain (every N decisions)
   
@@ -78,3 +79,5 @@ wandb:
   project: "CNN-with-RL"
   run_name: null  # Will be auto-generated based on timestamp if null
   log_interval: 1  # Log every N epochs
+
+# TODO: update default.yaml file to have correct and all configs

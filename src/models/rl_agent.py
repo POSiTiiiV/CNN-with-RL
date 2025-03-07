@@ -37,16 +37,23 @@ class TimestepLoggingCallback(BaseCallback):
     """
     Custom callback for logging the number of timesteps done/remaining.
     """
-    def __init__(self, total_timesteps, verbose=0):
+    def __init__(self, total_timesteps, verbose=1):
         super(TimestepLoggingCallback, self).__init__(verbose)
         self.total_timesteps = total_timesteps
 
     def _on_step(self) -> bool:
-        # Log the number of timesteps done/remaining
+        # Log the number of timesteps done/total
         timesteps_done = self.num_timesteps
-        timesteps_remaining = self.total_timesteps - timesteps_done
-        logger.info(f"Timesteps done: {timesteps_done}, Timesteps remaining: {timesteps_remaining}")
-        return True
+        logger.info(f"Timesteps done: {timesteps_done}, Total timesteps: {self.total_timesteps}")
+        return timesteps_done < self.total_timesteps
+
+class LRScheduler:
+    def __init__(self, initial_lr):
+        self.initial_lr = initial_lr
+
+    def __call__(self, progress_remaining):
+        """Linear learning rate decay"""
+        return self.initial_lr * progress_remaining
 
 class HyperParameterOptimizer:
     """
@@ -70,42 +77,43 @@ class HyperParameterOptimizer:
         self.brain_save_dir = config.get('brain_save_dir', 'models/rl_brains')
 
         # Dynamic threshold for intervention 
-        self.intervention_threshold = config.get('intervention_threshold', 0.4)
+        self.intervention_threshold = config.get('intervention_threshold', 0.6)
         self.recent_intervention_scores = deque(maxlen=20)
         
         # Performance tracking for dynamic training schedule
         self.performance_history = deque(maxlen=10)
         self.reward_history = deque(maxlen=100)  # For normalizing rewards
-        self.train_decision_counter = 0
         self.best_reward = float('-inf')  # Track best reward for saving best model
 
-        # Dynamic training parameters
-        # Start with lower frequency but adjust based on performance
-        self.train_frequency_min = config.get('train_frequency_min', 5) 
-        self.train_frequency_max = config.get('train_frequency_max', 25)
-        self.train_frequency = self.train_frequency_min
+        # Track validation loss stability
+        self.val_loss_history = deque(maxlen=10)
         
-        # Increased training timesteps as suggested (5000-10000)
-        self.training_timesteps_min = config.get('training_timesteps_min', 5000)  # Minimum timesteps
-        self.training_timesteps_max = config.get('training_timesteps_max', 10000) # Maximum timesteps
+        # Adaptive training timesteps based on CNN training progress
+        self.training_timesteps_min = config.get('training_timesteps_min', 500)
+        self.training_timesteps_max = config.get('training_timesteps_max', 10000)
         self.training_timesteps = self.training_timesteps_min
         self.training_step = 0
+        self.cnn_epochs_completed = 0
 
+        # Batch learning parameters
+        self.collected_episodes = []
+        self.max_episodes_memory = config.get('max_episodes_memory', 20)
+        self.min_episodes_for_training = config.get('min_episodes_for_training', 3)
+        
+        # Intervention threshold boundaries
+        self.min_intervention_threshold = config.get('min_intervention_threshold', 0.3)
+        self.max_intervention_threshold = config.get('max_intervention_threshold', 0.8)
+        
         # Ensure brain save directory exists
         os.makedirs(self.brain_save_dir, exist_ok=True)
 
         # Initialize PPO agent with learning rate scheduler
         logger.info(f"Initializing PPO agent with learning rate scheduler")
-
-        # IMPROVEMENT 2: Use a learning rate scheduler
-        def lr_schedule(progress_remaining):
-            """Linear learning rate decay"""
-            return self.learning_rate * progress_remaining  # Decays from initial_lr to 0
-        
+        self.lr_scheduler = LRScheduler(self.learning_rate)
         self.agent = PPO(
-            "MlpPolicy",
+            "MultiInputPolicy",  # Changed from "MlpPolicy" to "MultiInputPolicy"
             env,
-            learning_rate=lr_schedule,  # Use scheduler instead of constant
+            learning_rate=self.lr_scheduler,
             n_steps=self.n_steps,
             batch_size=self.batch_size,
             n_epochs=self.n_epochs,
@@ -119,6 +127,7 @@ class HyperParameterOptimizer:
             device="cpu"
         )
 
+        self.intervention_frequency = config.get('intervention_frequency', 10)
         self.eval_callback = EvaluationCallback(eval_freq=1000)
         logger.info("HyperParameterOptimizer initialized with improved parameters")
 
@@ -133,84 +142,91 @@ class HyperParameterOptimizer:
         self.performance_history.append(reward)
         
         # Only adjust parameters when we have enough history
-        if len(self.performance_history) >= 5:
+        if len(self.performance_history) >= 3:
             recent_rewards = list(self.performance_history)
             
             # Check if rewards are improving or declining
             is_improving = recent_rewards[-1] > np.mean(recent_rewards[:-1])
             
-            # Adjust training frequency - train more often when performance is worse
+            # Adjust training frequency based on performance
             if is_improving:
                 # If improving, we can train less frequently (save compute)
-                self.train_frequency = min(self.train_frequency_max, 
-                                          self.train_frequency + 2)
+                self.train_frequency = min(self.train_frequency_max, self.train_frequency + 2)
             else:
                 # If not improving, train more frequently
-                self.train_frequency = max(self.train_frequency_min, 
-                                          self.train_frequency - 3)
+                self.train_frequency = max(self.train_frequency_min, self.train_frequency - 3)
             
-            # Adjust training timesteps - train more steps when performance is worse
-            if is_improving:
-                # If improving, we can train fewer timesteps
-                self.training_timesteps = max(self.training_timesteps_min,
-                                            self.training_timesteps - 500)
-            else:
-                # If not improving, train with more timesteps
-                self.training_timesteps = min(self.training_timesteps_max, 
-                                            self.training_timesteps + 1000)
+            # Adjust the intervention threshold based on performance
+            # If model is performing well (high rewards), be more conservative with interventions
+            # If model is performing poorly, be more aggressive with interventions
+            if np.mean(recent_rewards) > 0.3:  # Good performance
+                # Be more conservative - increase threshold to intervene less often
+                self.intervention_threshold = min(
+                    self.max_intervention_threshold,
+                    self.intervention_threshold + 0.05
+                )
+            else:  # Poor performance
+                # Be more aggressive - decrease threshold to intervene more often
+                self.intervention_threshold = max(
+                    self.min_intervention_threshold,
+                    self.intervention_threshold - 0.05
+                )
             
-            # Adjust intervention threshold based on recent intervention decisions
-            if self.recent_intervention_scores:
-                # Calculate variance in decisions
-                decision_variance = np.var(list(self.recent_intervention_scores))
-                
-                # If decisions are very consistent, adjust threshold to promote some exploration
-                if decision_variance < 0.05:  # Low variance means consistent decisions
-                    # Slightly lower threshold to encourage occasional interventions
-                    self.intervention_threshold = max(0.2, self.intervention_threshold - 0.05)
-                elif decision_variance > 0.2:  # High variance means too much flip-flopping
-                    # Slightly raise threshold for more stability
-                    self.intervention_threshold = min(0.6, self.intervention_threshold + 0.03)
-                    
             logger.debug(f"Dynamic parameters updated - Train frequency: {self.train_frequency}, " +
                         f"Timesteps: {self.training_timesteps}, " +
-                        f"Threshold: {self.intervention_threshold:.2f}")
+                        f"Intervention threshold: {self.intervention_threshold:.2f}")
 
-    def optimize_hyperparameters(self, observation):
+    def optimize_hyperparameters(self, observation: Dict[str, np.ndarray]) -> Optional[Dict[str, Any]]:
         """
-        Decide whether to intervene based on the RL agent's policy.
+        Decide whether to intervene based on performance trends and agent's policy.
+        Takes into account both immediate metrics and longer-term trends.
         """
         self.last_observation = observation.copy()
 
         try:
             # Ensure observation matches expected shape
-            if observation.shape != self.env.observation_space.shape:
-                observation = np.resize(observation, self.env.observation_space.shape)
+            if observation['metrics'].shape != self.env.observation_space['metrics'].shape or \
+               observation['hyperparams'].shape != self.env.observation_space['hyperparams'].shape:
+                # If observation includes trend data but environment doesn't support it yet,
+                # truncate to fit the expected shape
+                observation['metrics'] = np.resize(observation['metrics'], self.env.observation_space['metrics'].shape)
+                observation['hyperparams'] = np.resize(observation['hyperparams'], self.env.observation_space['hyperparams'].shape)
 
-            # Get action from PPO
-            action, _states = self.agent.predict(observation.reshape(1, -1))
+            # Get action from PPO agent
+            action, _states = self.agent.predict(observation)
 
             self.last_action = action[0].copy()
+            
+            # Extract intervention score (first action component)
             intervention_score = action[0][0] if isinstance(action[0], np.ndarray) else action[0]
             
             # Track past intervention scores
             self.recent_intervention_scores.append(intervention_score)
 
-            # Use the dynamic threshold for intervention decision
+            # Log detailed score and threshold
             logger.debug(f"Intervention score: {intervention_score:.4f} (threshold: {self.intervention_threshold:.4f})")
+            logger.debug(f"Observation values: val_acc={observation['metrics'][0]:.4f}, val_loss_norm={observation['metrics'][1]:.4f}")
+            
+            # If trend data is included (extended observation), log that too
+            if len(observation['metrics']) > 18:
+                logger.debug(f"Trend data: improvement_rate={observation['metrics'][14]:.4f}, "
+                           f"loss_trend={observation['metrics'][15]:.4f}, acc_trend={observation['metrics'][16]:.4f}, "
+                           f"is_stagnating={observation['metrics'][17]:.1f}")
 
+            # If score below threshold, don't intervene
             if intervention_score < self.intervention_threshold:
-                logger.info("RL agent decided not to intervene")
                 return None
 
-            # IMPROVEMENT 1: Fix potential KeyError in action_to_hp_dict
+            # Convert action to hyperparameters with improved error handling
             try:
-                hyperparams = self.env.action_to_hp_dict(action[0])
-                # Validate hyperparams to ensure all required keys exist
+                if isinstance(action[0], np.ndarray):
+                    action = action[0].tolist()
+                hyperparams = self.env.action_to_hp_dict(action)
+                # Validate hyperparameters
                 required_keys = ['learning_rate', 'dropout_rate', 'weight_decay', 'optimizer_type']
                 if not all(key in hyperparams for key in required_keys):
                     logger.warning(f"Missing required keys in hyperparams: {hyperparams}")
-                    # Provide defaults for any missing keys
+                    # Provide defaults for missing keys
                     defaults = {
                         'learning_rate': 0.001,
                         'dropout_rate': 0.5,
@@ -222,90 +238,116 @@ class HyperParameterOptimizer:
                             hyperparams[key] = defaults[key]
             except Exception as e:
                 logger.error(f"Error converting action to hyperparams: {e}")
-                return None  # Return None instead of crashing
-                
-            logger.info(f"Intervening with hyperparameters: {hyperparams}")
+                return None
+            
+            # Log the intervention decision with proposed hyperparameters
+            logger.info(f"RL agent decided to intervene with hyperparams: {hyperparams}")
             return hyperparams
 
         except Exception as e:
             logger.error(f"Error during hyperparameter optimization: {str(e)}")
             return None
 
-    def learn_from_intervention(self, new_observation, reward, intervened=True):
+    def learn_from_episode(self, episode_rewards):
         """
-        Train the RL agent based on the outcome of the last intervention.
+        Collect episode rewards without immediately training the agent.
+        Training only happens after collecting enough episodes.
+        
+        Args:
+            episode_rewards (List[float]): List of rewards from the episode
         """
-        if self.last_observation is None or self.last_action is None:
-            logger.warning("Cannot train RL agent: no previous action stored")
-            return False
-
         try:
-            # Reward shaping
-            if not intervened:
-                reward = 0.1  # Base reward for stability
-                if len(self.recent_intervention_scores) > 1:
-                    recent_change = self.recent_intervention_scores[-1] - self.recent_intervention_scores[-2]
-                    if recent_change < 0:
-                        reward += 0.2  # Extra reward for avoiding bad interventions
-            else:
-                reward -= 0.05 * len(self.recent_intervention_scores)  # Penalty for frequent interventions
+            if not episode_rewards:
+                logger.warning("Empty episode rewards, skipping collection")
+                return False
+                
+            # Store this episode's rewards
+            self.collected_episodes.append(episode_rewards)
+            logger.info(f"Collected episode with {len(episode_rewards)} reward(s). " + 
+                       f"Total episodes: {len(self.collected_episodes)}/{self.min_episodes_for_training}")
             
-            # IMPROVEMENT 4: Normalize rewards
-            self.reward_history.append(reward)
-            if len(self.reward_history) > 1:
-                mean_reward = np.mean(self.reward_history)
-                std_reward = np.std(self.reward_history) + 1e-5  # Avoid division by zero
-                normalized_reward = (reward - mean_reward) / std_reward
-                
-                # Cap normalized reward to avoid extreme values
-                normalized_reward = max(min(normalized_reward, 5.0), -5.0)
-                logger.info(f"Original reward: {reward:.4f}, Normalized: {normalized_reward:.4f}")
-                reward = normalized_reward
-
-            # IMPROVEMENT 3: Save best model when performance improves
-            if reward > self.best_reward:
-                self.best_reward = reward
-                best_model_path = os.path.join(self.brain_save_dir, "best_rl_brain.zip")
-                self.save_brain(best_model_path)
-                logger.info(f"New best model saved with reward: {reward:.4f}")
+            # Keep memory limited
+            if len(self.collected_episodes) > self.max_episodes_memory:
+                self.collected_episodes = self.collected_episodes[-self.max_episodes_memory:]
             
-            # Update dynamic parameters based on performance
-            self._update_dynamic_parameters(reward)
-
-            # Increment training step and decision counter
-            self.training_step += 1
-            self.train_decision_counter += 1
-
-            # Update environment state if needed
-            if hasattr(self.env, 'update_state'):
-                self.env.update_state(new_observation)
-
-            # Use dynamic training schedule based on performance
-            if self.train_decision_counter >= self.train_frequency:
-                self.train_decision_counter = 0  # Reset counter
+            # Only train if we have enough episodes
+            if len(self.collected_episodes) < self.min_episodes_for_training:
+                logger.info(f"Not enough episodes for training yet. " +
+                           f"Have {len(self.collected_episodes)}, need {self.min_episodes_for_training}")
+                return False
                 
-                logger.info(f"Training PPO agent at step {self.training_step} for {self.training_timesteps} timesteps")
-                
-                # Create and use the custom callback for logging
-                timestep_logging_callback = TimestepLoggingCallback(total_timesteps=self.training_timesteps)
-                
-                # Train the agent with updated parameters
-                self.agent.learn(
-                    total_timesteps=self.training_timesteps, 
-                    reset_num_timesteps=False,
-                    callback=timestep_logging_callback
-                )
-                
-                # Log progress after training
-                progress = min(1.0, self.training_step / 1000)
-                current_lr = self.learning_rate * (1 - progress)
-                logger.info(f"Completed training. Current LR: {current_lr:.6f}, Progress: {progress:.2f}")
-
-            return True
+            # When we have enough episodes, trigger the actual training
+            return self._train_agent_with_collected_episodes()
 
         except Exception as e:
-            logger.error(f"Error during RL agent training: {str(e)}")
+            logger.error(f"Error during RL agent episode collection: {str(e)}")
             return False
+            
+    def _train_agent_with_collected_episodes(self): # TODO: is it even using previous rewards or past interventions
+        """
+        Train the agent using all collected episodes.
+        This separates collection from actual training.
+        """
+        # Extract all rewards from collected episodes
+        all_rewards = []
+        for ep in self.collected_episodes:
+            all_rewards.extend(ep)
+                
+        if not all_rewards:
+            logger.warning("No rewards to train on despite having episodes")
+            return False
+            
+        # Normalize rewards across all episodes
+        mean_reward = np.mean(all_rewards)
+        std_reward = np.std(all_rewards)
+        std_reward = max(std_reward, 0.1)  # Prevent division by zero
+        normalized_rewards = [(r - mean_reward) / std_reward for r in all_rewards]
+        normalized_rewards = [max(min(r, 5.0), -5.0) for r in normalized_rewards]
+        
+        logger.info(f"Training PPO agent with {len(normalized_rewards)} rewards from {len(self.collected_episodes)} episodes")
+        logger.info(f"Average reward: {mean_reward:.4f}, training for {self.training_timesteps} timesteps")
+        
+        # Train the agent with collected experiences
+        timestep_logging_callback = TimestepLoggingCallback(total_timesteps=self.training_timesteps)
+        self.agent.learn(
+            total_timesteps=self.training_timesteps, 
+            reset_num_timesteps=False,
+            callback=timestep_logging_callback
+        )
+        
+        # Update dynamic parameters based on mean performance
+        self._update_dynamic_parameters(mean_reward)
+        
+        # Reset collection after training
+        self.collected_episodes = []
+        
+        # Update training counter
+        self.training_step += 1
+        progress = min(1.0, self.training_step / 1000)
+        current_lr = self.learning_rate * np.exp(-progress)
+        logger.info(f"Completed RL training. Current LR: {current_lr:.6f}, Progress: {progress:.2f}")
+        
+        return True
+
+    def update_cnn_epoch(self, epoch):
+        """
+        Update the current CNN training epoch to adjust RL training parameters.
+        
+        Args:
+            epoch (int): Current CNN training epoch
+        """
+        self.cnn_epochs_completed = epoch
+        
+        # Adjust training steps based on CNN training progress
+        if epoch < 30:
+            # Very conservative in early stages
+            self.training_timesteps = self.training_timesteps_min
+        elif epoch < 50:
+            # Gradually increase
+            self.training_timesteps = int(self.training_timesteps_min * 1.5)
+        elif epoch < 75:
+            # More substantial training as we have more data
+            self.training_timesteps = int(self.training_timesteps_min * 2)
 
     def save_brain(self, filepath=None):
         """

@@ -10,6 +10,7 @@ from tqdm import tqdm
 import matplotlib.pyplot as plt
 from typing import Dict, List, Any, Optional, Union, Tuple
 import wandb
+from ..utils.utils import create_observation, enhance_observation_with_trends, calculate_performance_trends
 
 logger = logging.getLogger(__name__)
 
@@ -33,17 +34,41 @@ class ModelTrainer:
         """
         self.cnn_trainer = cnn_trainer
         self.rl_optimizer = rl_optimizer
-        self.config = config
+        self.config_training = config['training']
+        self.config_logging = config['logging']
+        self.config_rl = config['rl']
         
         # Get training parameters
-        self.max_epochs = config['training'].get('max_epochs', 100)
-        self.early_stopping_patience = config['training'].get('early_stopping_patience', 25)
-        self.eval_frequency = config['training'].get('eval_frequency', 1)
-        self.checkpoint_frequency = config['training'].get('checkpoint_frequency', 5)
-        self.min_epochs_before_intervention = config['training'].get('min_epochs_before_intervention', 5)
+        self.max_epochs = self.config_training.get('max_epochs', 100)
+        self.early_stopping_patience = self.config_training.get('early_stopping_patience', 25)
+        self.checkpoint_frequency = self.config_training.get('checkpoint_frequency', 5)
+        self.min_epochs_before_intervention = self.config_training.get('min_epochs_before_intervention', 10)
+        
+        # Parameters for improved RL intervention strategy
+        self.val_loss_window = self.config_training.get('val_loss_window', 5)
+        self.loss_stagnation_threshold = self.config_training.get('loss_stagnation_threshold', 0.003)
+        
+        # NEW: Performance trend monitoring
+        self.metric_window_size = self.config_training.get('metric_window_size', 5)  # Rolling window size
+        self.improvement_threshold = self.config_training.get('improvement_threshold', 0.002)  # Minimum expected improvement
+        
+        # NEW: Gradual autonomy parameters
+        self.initial_autonomy = self.config_rl.get('initial_autonomy', 0.2)  # Initially follow rules more
+        self.max_autonomy = self.config_rl.get('max_autonomy', 0.9)  # Eventually, trust RL more
+        self.current_autonomy = self.initial_autonomy  
+        self.autonomy_increase_rate = self.config_rl.get('autonomy_increase_rate', 0.05)  # Rate of increase after successful interventions
+        self.successful_interventions = 0
+        
+        # Intervention control and episode collection
+        self.intervention_count = 0
+        self.intervention_frequency = self.config_training.get('intervention_frequency', 5)
+        self.last_intervention_epoch = 0
+        self.epochs_without_improvement_threshold = self.config_training.get('epochs_without_improvement_threshold', 3)
+        self.collected_intervention_results = []
+        self.min_interventions_for_learning = self.config_rl.get('min_interventions_for_learning', 5)  # Collect at least 5 interventions
         
         # Setup logging
-        self.log_dir = config['logging'].get('log_dir', 'logs')
+        self.log_dir = self.config_logging.get('log_dir', 'logs')
         os.makedirs(self.log_dir, exist_ok=True)
         self.checkpoint_dir = os.path.join(self.log_dir, 'checkpoints')
         os.makedirs(self.checkpoint_dir, exist_ok=True)
@@ -67,26 +92,30 @@ class ModelTrainer:
         self.best_val_loss = float('inf')
         self.epochs_without_improvement = 0
         self.training_interrupted = False
-        self.intervention_history = []
         self.start_time = None
+        self.last_intervention_metrics = None
         
         # Initialize history file paths
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.history_file = os.path.join(self.log_dir, f"training_history_{timestamp}.json")
-        # Also save a copy to a fixed location for easy access
-        self.fixed_history_file = os.path.join(self.log_dir, "training_history.json")
+        # Fixed location for training history for easy access
+        training_history_dir = 'training_history'
+        os.makedirs(training_history_dir, exist_ok=True)
+        self.fixed_history_file = os.path.join(training_history_dir, f"training_history_{timestamp}.json")
         
         # Setup signal handling for graceful termination
         self._setup_signal_handling()
         
         # Initialize wandb
-        self.use_wandb = config['logging'].get('use_wandb', True)
+        self.use_wandb = self.config_logging.get('use_wandb', True)
         self.wandb_initialized = True
+        
+        # NEW: Track the global wandb step to prevent monotonicity issues
+        self.global_wandb_step = 0
         
         # Create RL brain directory
         self.rl_brain_dir = os.path.join(self.log_dir, 'rl_brains')
         os.makedirs(self.rl_brain_dir, exist_ok=True)
-
 
     def train(self, epochs: Optional[int] = None) -> Dict[str, List]:
         """
@@ -100,10 +129,6 @@ class ModelTrainer:
         """
         if epochs is not None:
             self.max_epochs = epochs
-            
-        # Initialize wandb before training starts
-        if self.use_wandb and not self.wandb_initialized:
-            self._init_wandb()
         
         # Track pre-intervention metrics
         self.last_intervention_metrics = None
@@ -125,11 +150,7 @@ class ModelTrainer:
                 train_metrics = self.cnn_trainer.train_epoch()
                 epoch_time = time.time() - epoch_start_time
                 
-                # Evaluate if needed
-                if (epoch + 1) % self.eval_frequency == 0:
-                    val_metrics = self.cnn_trainer.evaluate()
-                else:
-                    val_metrics = {'loss': None, 'accuracy': None}
+                val_metrics = self.cnn_trainer.evaluate()
                 
                 # Update history with metrics
                 self._update_history(epoch, train_metrics, val_metrics, epoch_time)
@@ -173,16 +194,10 @@ class ModelTrainer:
                     # Log to wandb
                     self._log_to_wandb(epoch, train_metrics, val_metrics, epoch_time)
                     
-                    # Store current metrics before potential intervention
-                    pre_intervention_metrics = {
-                        'val_acc': val_acc,
-                        'val_loss': val_loss
-                    }
-                    
                     # Check if RL intervention is needed
-                    if self._check_for_intervention():
-                        # Store pre-intervention metrics for reward calculation
-                        self.last_intervention_metrics = pre_intervention_metrics
+                    if (epoch + 1) % self.intervention_frequency == 0:  # TODO: instead of checking for intervention after every 'intervention_frequency' epochs(i,e., (current_epoch+1) % intervention_frequency == 0), we should check after 'intervention_frequency' number of epochs have passed since last the intervention
+                        if self._check_for_intervention():
+                            self.last_intervention_epoch = epoch + 1 # TODO: add a else statement telling the user how long till intervention
                 else:
                     # Log progress without validation metrics
                     logger.info(
@@ -267,6 +282,10 @@ class ModelTrainer:
             return
             
         try:
+            # Use global step counter instead of epoch to ensure monotonicity
+            self.global_wandb_step += 1
+            current_step = self.global_wandb_step
+            
             # Prepare metrics to log
             metrics = {
                 "epoch": epoch + 1,
@@ -297,59 +316,98 @@ class ModelTrainer:
                 "training/best_val_acc": self.best_val_acc,
             })
             
-            # Log to wandb
-            wandb.log(metrics, step=epoch + 1)
+            # Log to wandb with the global step
+            wandb.log(metrics, step=current_step)
             
         except Exception as e:
             logger.warning(f"Failed to log to Weights & Biases: {str(e)}")
 
     def _check_for_intervention(self) -> bool:
         """
-        Let the RL agent decide if intervention is needed and apply hyperparameter changes.
-        
-        Returns:
-            bool: True if intervention occurred, False otherwise
+        Determine if intervention is needed based on performance trends.
+        Uses a mix of rule-based and RL-based decisions with increasing autonomy.
         """
-        # Only consider intervention after minimum number of epochs to allow for initial training
-        if self.current_epoch < self.min_epochs_before_intervention:
+        # Only consider intervention after minimum number of epochs
+        if (self.current_epoch+1) < self.min_epochs_before_intervention:
+            logger.info(f"Not intervening: Only at epoch {self.current_epoch+1}, need {self.min_epochs_before_intervention}")
             return False
             
-        # Prepare observation for RL agent
-        observation = self._prepare_observation()
+        # Update the RL agent's CNN epoch awareness
+        self.rl_optimizer.update_cnn_epoch(self.current_epoch)
         
-        # Let the RL agent decide if intervention is needed
-        new_hyperparams = self.rl_optimizer.optimize_hyperparameters(observation)
+        # Calculate performance trends using rolling windows
+        trend_data = calculate_performance_trends({
+            'history': self.history,
+            'metric_window_size': self.metric_window_size,
+            'improvement_threshold': self.improvement_threshold,
+            'loss_stagnation_threshold': self.loss_stagnation_threshold
+        })
+        is_stagnating = trend_data['is_stagnating']
+        improvement_rate = trend_data['improvement_rate']
         
-        # If RL agent returns None or empty dict, no intervention needed
-        if not new_hyperparams:
-            # Log that we considered an intervention but the agent declined
-            logger.info(f"RL agent decided not to intervene at epoch {self.current_epoch+1}")
+        # Only consider intervention if the model is stagnating or not improving fast enough
+        if not is_stagnating and improvement_rate > self.improvement_threshold:
+            logger.info(f"Training still progressing well (improvement rate: {improvement_rate:.5f})")
+            return False
             
-            # Track this decision not to intervene for learning
-            if self.wandb_initialized:
-                try:
-                    wandb.log({
-                        "rl_considered_intervention": True,
-                        "rl_decided_to_intervene": False,
-                        "rl_intervention_epoch": self.current_epoch + 1
-                    }, step=self.current_epoch + 1)
-                except Exception as e:
-                    logger.warning(f"Failed to log RL non-intervention to W&B: {str(e)}")
-                    
-            # Store pre-intervention metrics for potential rewards
-            # (even for non-interventions, so agent can learn if this was a good choice)
+        # Log trend data
+        logger.info(f"Performance trends: stagnating={is_stagnating}, " +
+                    f"improvement_rate={improvement_rate:.5f}, " +
+                    f"autonomy_level={self.current_autonomy:.2f}")
+        
+        # Mixed decision strategy based on current autonomy level
+        # Lower autonomy = more rule-based decisions
+        # Higher autonomy = more RL-based decisions
+        rule_based_decision = is_stagnating or improvement_rate < self.improvement_threshold
+        
+        # Prepare observation for RL agent
+        current_hyperparams = self._get_current_hyperparams()
+        observation = create_observation({
+            'history': self.history,
+            'current_hyperparams': current_hyperparams,
+            'best_val_acc': self.best_val_acc,
+            'best_val_loss': self.best_val_loss,
+            'current_step': self.current_epoch,
+            'max_steps': self.max_epochs,
+            'no_improvement_count': self.epochs_without_improvement,
+            'patience': self.early_stopping_patience
+        })
+        observation = enhance_observation_with_trends(observation, trend_data)
+        
+        # Get RL agent's decision
+        new_hyperparams = self.rl_optimizer.optimize_hyperparameters(observation)
+        rl_decided_to_intervene = new_hyperparams is not None
+        
+        # Make final decision based on weighted combination of rule and RL
+        random_factor = np.random.random()  # TODO: it looks like its supposed to be explore/exploit but i dont think the implementation is correct/complete
+        should_intervene = (
+            (random_factor > self.current_autonomy and rule_based_decision) or  # Rule-based with (1-autonomy) probability
+            (random_factor <= self.current_autonomy and rl_decided_to_intervene)  # RL-based with autonomy probability
+        )
+        
+        # Log the decision factors
+        logger.info(f"Intervention decision: rule={rule_based_decision}, RL={rl_decided_to_intervene}, " +
+                    f"final={should_intervene}, autonomy={self.current_autonomy:.2f}")
+        
+        if not should_intervene or not new_hyperparams:
+            # Store metrics for non-intervention case
             if len(self.history['val_acc']) > 0:
                 self.last_intervention_metrics = {
                     'val_acc': self.history['val_acc'][-1],
                     'val_loss': self.history['val_loss'][-1],
-                    'intervened': False
+                    'intervened': False,
+                    'epoch': self.current_epoch,
+                    'trend_data': trend_data  # Store trend data for later reward calculation
                 }
-                
             return False
             
         # Apply new hyperparameters
         logger.info(f"RL agent intervening at epoch {self.current_epoch+1}")
         logger.info(f"New hyperparameters: {new_hyperparams}")
+        
+        # Increment intervention counter
+        self.intervention_count += 1
+        self.last_intervention_epoch = self.current_epoch+1
         
         # Store pre-intervention metrics for calculating reward later
         val_acc = self.history['val_acc'][-1] if self.history['val_acc'] else 0
@@ -359,60 +417,142 @@ class ModelTrainer:
         self.last_intervention_metrics = {
             'val_acc': val_acc,
             'val_loss': val_loss,
-            'intervened': True
+            'intervened': True,
+            'epoch': self.current_epoch,
+            'hyperparams': new_hyperparams.copy(),
+            'trend_data': trend_data  # Store trend data for later reward calculation
         }
         
-        # Update model with new hyperparameters
-        self.cnn_trainer.model.update_hyperparams(new_hyperparams)
+        # Determine if the intervention is major or minor
+        major_intervention = self._is_major_intervention(new_hyperparams)
         
-        # Update optimizer
-        self.cnn_trainer.optimizer = self.cnn_trainer.model.get_optimizer()
+        if major_intervention:
+            logger.info("Major intervention detected, restarting training from scratch")
+            self._restart_training(new_hyperparams)
+        else:
+            logger.info("Minor intervention detected, continuing training")
+            self._apply_hyperparams(new_hyperparams)
         
-        # Record intervention in history
+        # Record the intervention in history
         intervention = {
             'epoch': self.current_epoch + 1,
             'hyperparameters': new_hyperparams.copy(),
-            'val_acc_before': val_acc
+            'val_acc_before': val_acc,
+            'val_loss_before': val_loss,
+            'is_major': major_intervention
         }
         self.history['rl_interventions'].append(intervention)
-        
-        # Update hyperparameters in history
         self.history['hyperparameters'].append(new_hyperparams.copy())
         
-        # Log intervention to wandb
         if self.wandb_initialized:
             try:
-                # Log the intervention event
+                # Use global step counter instead of epoch
+                self.global_wandb_step += 1
+                current_step = self.global_wandb_step
+                
                 wandb.log({
                     "rl_considered_intervention": True,
                     "rl_decided_to_intervene": True,
                     "rl_intervention_epoch": self.current_epoch + 1,
-                    "val_acc_before_intervention": val_acc
-                }, step=self.current_epoch + 1)
+                    "rl_intervention_type": "major" if major_intervention else "minor",
+                    "val_acc_before_intervention": val_acc,
+                    "intervention_count": self.intervention_count
+                }, step=current_step)
                 
-                # Log the hyperparameter changes
-                changes = {}
                 for param_name, new_value in new_hyperparams.items():
-                    # For complex structures like fc_layers, convert to string for logging
                     if not isinstance(new_value, (int, float, str, bool)):
                         new_value = str(new_value)
-                    changes[f"rl_changes/{param_name}"] = new_value
-                
-                wandb.log(changes, step=self.current_epoch + 1)
-                
+                    wandb.log({f"rl_changes/{param_name}": new_value}, step=current_step)
             except Exception as e:
                 logger.warning(f"Failed to log RL intervention to Weights & Biases: {str(e)}")
         
         return True
 
-    def _provide_rl_reward_after_training(self, pre_val_acc, pre_val_loss, intervened=True):
+    def _is_major_intervention(self, new_hyperparams: Dict[str, Any]) -> bool:
         """
-        Calculate reward for RL agent and make it learn based on the intervention outcome.
+        Determine if the intervention is major (requiring a restart) or minor.
         
         Args:
-            pre_val_acc: Validation accuracy before intervention
-            pre_val_loss: Validation loss before intervention
-            intervened: Whether an intervention was actually performed
+            new_hyperparams: New hyperparameters proposed by the RL agent
+            
+        Returns:
+            bool: True if the intervention is major, False otherwise
+        """
+        major_keys = ['fc_config', 'optimizer_type']
+        for key in major_keys:
+            if key in new_hyperparams and new_hyperparams[key] != self._get_current_hyperparams().get(key):
+                return True
+        return False
+
+    def _restart_training(self, new_hyperparams: Dict[str, Any]) -> None:
+        """
+        Restart training from scratch with new hyperparameters.
+        
+        Args:
+            new_hyperparams: New hyperparameters proposed by the RL agent
+        """
+        self.cnn_trainer.model.update_hyperparams(new_hyperparams)
+        self.cnn_trainer.optimizer = self.cnn_trainer.model.get_optimizer()
+        self.current_epoch = 0
+        self.best_val_acc = 0.0
+        self.best_val_loss = float('inf')
+        self.epochs_without_improvement = 0
+        
+        # Don't reset global_wandb_step when restarting training
+        # This ensures wandb logging remains monotonic
+        
+        self.history = {
+            'epoch': [],
+            'train_loss': [],
+            'train_acc': [],
+            'val_loss': [],
+            'val_acc': [],
+            'hyperparameters': [],
+            'rl_interventions': [],
+            'time_per_epoch': [],
+            'timestamp': []
+        }
+
+    def _apply_hyperparams(self, new_hyperparams: Dict[str, Any]) -> None:
+        """
+        Apply new hyperparameters without restarting training.
+        
+        Args:
+            new_hyperparams: New hyperparameters proposed by the RL agent
+        """
+        self.cnn_trainer.model.update_hyperparams(new_hyperparams)
+        self.cnn_trainer.optimizer = self.cnn_trainer.model.get_optimizer()
+
+    def _check_loss_stability(self) -> bool:
+        """
+        Check if validation loss has stabilized (not improving significantly).
+        
+        Returns:
+            bool: True if loss is stable, False otherwise
+        """
+        # Make sure we have enough history
+        if len(self.history['val_loss']) < self.val_loss_window:
+            return False
+            
+        # Get the recent validation loss values
+        recent_losses = self.history['val_loss'][-self.val_loss_window:]
+        
+        # Calculate average change in loss
+        changes = [abs(recent_losses[i] - recent_losses[i-1]) for i in range(1, len(recent_losses))]
+        avg_change = sum(changes) / len(changes)
+        
+        # If average change is below threshold, consider loss stable
+        is_stable = avg_change < self.loss_stagnation_threshold
+        
+        if is_stable:
+            logger.info(f"Validation loss stabilized with avg change of {avg_change:.5f}")
+            
+        return is_stable
+
+    def _provide_rl_reward_after_training(self, pre_val_acc, pre_val_loss, intervened=True):
+        """
+        Calculate reward for RL agent based on long-term intervention impact.
+        Considers performance trends before and after intervention.
         """
         # Skip if we don't have recent validation metrics
         if not self.history['val_acc'] or not self.history['val_loss']:
@@ -422,55 +562,116 @@ class ModelTrainer:
         current_val_acc = self.history['val_acc'][-1]
         current_val_loss = self.history['val_loss'][-1]
         
+        # Calculate current trends to compare with pre-intervention trends
+        current_trends = calculate_performance_trends({
+            'history': self.history,
+            'metric_window_size': self.metric_window_size,
+            'improvement_threshold': self.improvement_threshold,
+            'loss_stagnation_threshold': self.loss_stagnation_threshold
+        })
+        
+        # Extract pre-intervention trends if available
+        pre_trends = self.last_intervention_metrics.get('trend_data', None)
+        
         if intervened:
-            # Calculate reward for an actual intervention
-            # Reward improvement in accuracy and reduction in loss
+            # Calculate immediate impact
             acc_improvement = current_val_acc - pre_val_acc
             loss_improvement = pre_val_loss - current_val_loss
+
+            # Normalize improvements to prevent excessive scaling
+            acc_improvement_norm = acc_improvement / (pre_val_acc + 1e-6)  # Avoid division by zero
+            loss_improvement_norm = loss_improvement / (pre_val_loss + 1e-6)
+
+            # Scale accuracy and loss contribution equally
+            immediate_reward = (acc_improvement_norm * 7.5 + loss_improvement_norm * 7.5) * 0.6
+
+            # Calculate trend-based improvement (scale dynamically)
+            trend_improvement = 0
+            if pre_trends:
+                trend_diff = current_trends['improvement_rate'] - pre_trends.get('improvement_rate', 0)
+                trend_improvement = np.clip(trend_diff * 10.0, -5.0, 5.0)  # Scale dynamically with limits
+
+            # Weight trends more in long-term training
+            reward = immediate_reward + (trend_improvement * 0.4)
+
+            # Allow negative rewards for worsening trends
+            if acc_improvement <= 0 and loss_improvement <= 0:
+                reward -= 0.2  # Small penalty if both worsen
+
+            # Prevent masking bad decisions with a minimum reward
+            if reward < 0:
+                reward = 0.0
+
+            # Update autonomy level based on success
+            self._update_autonomy(reward)
+
             
-            # Combine improvements into a reward
-            # Weight accuracy improvement higher
-            reward = acc_improvement * 10.0 + loss_improvement * 5.0
-            
-            # Ensure reward is not negative (minimum 0.1 to prevent discouraging exploration)
-            reward = max(0.1, reward)
-            
-            logger.info(f"RL reward for intervention: {reward:.4f} (acc: {current_val_acc:.4f} vs {pre_val_acc:.4f}, "
-                        f"loss: {current_val_loss:.4f} vs {pre_val_loss:.4f})")
+            logger.info(f"RL reward for intervention: {reward:.4f} (acc: {acc_improvement:.4f}, " +
+                        f"loss: {loss_improvement:.4f}, trend: {trend_improvement:.4f})")
         else:
-            # For non-interventions, compute what would have happened
-            # A small change or improvement means not intervening was good
-            # A large degradation means intervention might have been better
-            acc_change = abs(current_val_acc - pre_val_acc)
-            loss_change = abs(current_val_loss - pre_val_loss)
+            # For non-interventions, assess if the decision was good
+            # Compare current performance with expected performance had we intervened
+            # FIX: Assign the return value to the reward variable
+            reward = self._calculate_non_intervention_reward(pre_val_acc, pre_val_loss, current_val_acc, current_val_loss)
+        
+        # Store intervention result with trends
+        intervention_result = {
+            'pre_val_acc': pre_val_acc,
+            'pre_val_loss': pre_val_loss,
+            'post_val_acc': current_val_acc,
+            'post_val_loss': current_val_loss,
+            'reward': reward,  # Now reward is defined in both branches
+            'intervened': intervened,
+            'epoch': self.current_epoch,
+            'pre_trends': pre_trends,
+            'post_trends': current_trends
+        }
+        self.collected_intervention_results.append(intervention_result)
+        
+        # Train the RL agent if we have enough data
+        if len(self.collected_intervention_results) >= self.min_interventions_for_learning:
+            self._train_rl_from_collected_results()
+    
+    def _update_autonomy(self, reward: float):
+        """
+        Update the autonomy level based on intervention success.
+        Successful interventions increase RL agent's autonomy.
+        
+        Args:
+            reward: The reward received for the intervention
+        """
+        # Consider intervention successful if reward exceeds threshold
+        if reward > 0.5:  # Threshold for good intervention
+            self.successful_interventions += 1
+            # Increase autonomy gradually
+            autonomy_increase = self.autonomy_increase_rate * (reward / 2.0)  # Scale by reward
+            self.current_autonomy = min(self.max_autonomy, 
+                                       self.current_autonomy + autonomy_increase)
+            logger.info(f"Intervention successful, increased autonomy to {self.current_autonomy:.3f}")
+        else:
+            # Decrease autonomy slightly for unsuccessful interventions
+            self.current_autonomy = max(self.initial_autonomy, 
+                                      self.current_autonomy - 0.01)
+            logger.info(f"Intervention less successful, reduced autonomy to {self.current_autonomy:.3f}")
             
-            # If metrics got significantly worse, this might indicate we should have intervened
-            # If metrics stayed stable or improved, not intervening was a good choice
-            if acc_change < 0.01 and loss_change < 0.05:
-                # Stable or small improvement - good choice not to intervene
-                reward = 0.5  # Moderate positive reward
-            else:
-                if current_val_acc < pre_val_acc - 0.02:
-                    # Accuracy got significantly worse - should have intervened
-                    reward = 0.05  # Small reward (nearly neutral)
-                else:
-                    # Changes were acceptable without intervention
-                    reward = 0.2  # Small positive reward
+    def _train_rl_from_collected_results(self):
+        """Train the RL agent from collected intervention results."""
+        logger.info(f"Training RL agent with {len(self.collected_intervention_results)} intervention results")
+        
+        # Extract rewards from collected interventions
+        rewards = [result['reward'] for result in self.collected_intervention_results]
+        
+        # Train the RL agent with all collected rewards
+        training_successful = self.rl_optimizer.learn_from_episode(rewards)
+        
+        if training_successful:
+            logger.info("RL agent training successful")
             
-            logger.info(f"RL reward for non-intervention: {reward:.4f} (acc change: {acc_change:.4f}, "
-                        f"loss change: {loss_change:.4f})")
-        
-        # Create new observation after intervention/non-intervention
-        new_observation = self._prepare_observation()
-        
-        # Make RL agent learn from this outcome
-        self.rl_optimizer.learn_from_intervention(new_observation, reward, intervened=intervened)
-        
-        # Periodically save the RL brain (e.g., every 5 decisions)
-        decisions_count = len(self.history['rl_interventions'])
-        save_frequency = self.config.get('rl_brain_save_frequency', 5)
-        
-        if decisions_count > 0 and decisions_count % save_frequency == 0:
+            # Clear collected interventions
+            self.collected_intervention_results = []
+            
+            # Save the RL brain periodically
+            decisions_count = len(self.history['rl_interventions'])
             brain_path = os.path.join(
                 self.log_dir, 
                 'rl_brains', 
@@ -479,72 +680,8 @@ class ModelTrainer:
             os.makedirs(os.path.dirname(brain_path), exist_ok=True)
             self.rl_optimizer.save_brain(brain_path)
             logger.info(f"RL brain saved after {decisions_count} decisions")
-
-    def _prepare_observation(self) -> np.ndarray:
-        """
-        Prepare observation for RL agent with enhanced information.
-        
-        Returns:
-            np.ndarray: Observation vector
-        """
-        # Enhanced observation space with more metrics to help the agent decide when to intervene
-        observation = np.zeros(18, dtype=np.float32)
-        
-        # Fill with relevant metrics from history
-        if self.history['val_acc']:
-            observation[0] = self.history['val_acc'][-1]  # Current val accuracy
-            observation[1] = min(1.0, max(0.0, 1.0 - self.history['val_loss'][-1] / 10))  # Normalized val loss
-            observation[2] = self.history['train_acc'][-1] if self.history['train_acc'] else 0.0  # Train accuracy
-            observation[3] = min(1.0, max(0.0, 1.0 - self.history['train_loss'][-1] / 10))  # Normalized train loss
-            
-            # Add trend information - last 3 epochs
-            if len(self.history['val_acc']) >= 3:
-                # Accuracy trends (positive = improving, negative = degrading)
-                acc_trend1 = self.history['val_acc'][-1] - self.history['val_acc'][-2]
-                acc_trend2 = self.history['val_acc'][-2] - self.history['val_acc'][-3]
-                observation[4] = acc_trend1  # Most recent change
-                observation[5] = acc_trend2  # Previous change
-                
-                # Loss trends (positive = degrading, negative = improving)
-                loss_trend1 = self.history['val_loss'][-1] - self.history['val_loss'][-2]
-                loss_trend2 = self.history['val_loss'][-2] - self.history['val_loss'][-3]
-                observation[6] = -loss_trend1  # Negative so positive = improving
-                observation[7] = -loss_trend2  # Negative so positive = improving
-        
-        # Best performance so far
-        observation[8] = self.best_val_acc  # Best validation accuracy
-        observation[9] = min(1.0, max(0.0, 1.0 - self.best_val_loss / 10))  # Normalized best val loss
-        
-        # Current hyperparameters (normalized)
-        current_hyperparams = self._get_current_hyperparams()
-        
-        # Learning rate (log scale normalization)
-        lr = current_hyperparams.get('learning_rate', 0.001)
-        observation[10] = (np.log10(lr) + 5) / 3  # Log scale from 1e-5 to 1e-2
-            
-        # Weight decay (log scale normalization)
-        wd = current_hyperparams.get('weight_decay', 1e-4)
-        observation[11] = (np.log10(wd) + 6) / 4  # Log scale from 1e-6 to 1e-2
-            
-        # Dropout rate (linear scale)
-        observation[12] = current_hyperparams.get('dropout_rate', 0.5)
-            
-        # Optimizer type (one-hot like encoding)
-        opt_type = current_hyperparams.get('optimizer_type', 'adam')
-        if opt_type == 'adam':
-            observation[13] = 0.33
-        elif opt_type == 'sgd':
-            observation[14] = 0.33
-        else:  # adamw
-            observation[15] = 0.33
-        
-        # Training progress
-        observation[16] = self.current_epoch / self.max_epochs  # Progress through training
-        
-        # Epochs without improvement (normalized)
-        observation[17] = self.epochs_without_improvement / self.early_stopping_patience
-        
-        return observation
+        else:
+            logger.warning("RL agent training failed")
 
     def _get_current_hyperparams(self) -> Dict[str, Any]:
         """
@@ -576,23 +713,10 @@ class ModelTrainer:
             val_metrics: Validation metrics dict or tuple
             epoch_time: Time taken for this epoch
         """
-        # Handle train metrics (which could be tuple or dict)
-        if isinstance(train_metrics, tuple):
-            train_loss, train_acc = train_metrics
-        elif isinstance(train_metrics, dict):
-            train_loss = train_metrics.get('loss', 0)
-            train_acc = train_metrics.get('accuracy', 0)
-        else:
-            train_loss, train_acc = 0, 0
-            
-        # Handle validation metrics (which could be tuple or dict)
-        if isinstance(val_metrics, tuple):
-            val_loss, val_acc = val_metrics
-        elif isinstance(val_metrics, dict):
-            val_loss = val_metrics.get('loss', 0)
-            val_acc = val_metrics.get('accuracy', 0)
-        else:
-            val_loss, val_acc = 0, 0
+        train_loss = train_metrics.get('loss', 0)
+        train_acc = train_metrics.get('accuracy', 0)
+        val_loss = val_metrics.get('loss', 0)
+        val_acc = val_metrics.get('accuracy', 0)
             
         # Update history
         self.history['train_loss'].append(train_loss)
@@ -602,18 +726,66 @@ class ModelTrainer:
         self.history['time_per_epoch'].append(epoch_time)
         self.history['timestamp'].append(datetime.now().isoformat())
         
-        # Check if there was a recent intervention (within the last epoch)
-        if (hasattr(self, 'last_intervention_metrics') and 
-            self.last_intervention_metrics is not None):
-            # Calculate reward and provide feedback to RL agent
-            self._provide_rl_reward_after_training(
-                self.last_intervention_metrics['val_acc'],
-                self.last_intervention_metrics['val_loss'],
-                intervened=self.last_intervention_metrics.get('intervened', True)
-            )
-            # Clear the last intervention metrics after providing reward
-            self.last_intervention_metrics = None
+        # Check if there was a recent intervention
+        if self.last_intervention_metrics is not None:
+            # Add safety check in case epoch key is missing
+            if 'epoch' in self.last_intervention_metrics:
+                epochs_since_intervention = self.current_epoch - self.last_intervention_metrics['epoch']
+            else:
+                # If epoch key is missing, default to waiting 5 epochs
+                self.last_intervention_metrics['epoch'] = self.current_epoch - 5
+                epochs_since_intervention = 5
+                logger.warning("Missing 'epoch' key in intervention metrics, defaulting to 5 epochs waiting period")
+            
+            # Wait at least 5 epochs to properly evaluate the effect of an intervention
+            if epochs_since_intervention >= 5:
+                # Calculate reward and provide feedback to RL agent
+                self._provide_rl_reward_after_training(
+                    self.last_intervention_metrics['val_acc'],
+                    self.last_intervention_metrics['val_loss'],
+                    intervened=self.last_intervention_metrics['intervened']
+                )
+                # Clear the intervention metrics
+                self.last_intervention_metrics = None
 
+    def _calculate_non_intervention_reward(self, pre_val_acc, pre_val_loss, current_val_acc, current_val_loss):
+        """
+        Calculate the reward for not intervening.
+        
+        Args:
+            pre_val_acc: Validation accuracy before potential intervention
+            pre_val_loss: Validation loss before potential intervention
+            current_val_acc: Current validation accuracy
+            current_val_loss: Current validation loss
+            
+        Returns:
+            float: Reward value
+        """
+        # For non-interventions, compute what would have happened
+        # A small change or improvement means not intervening was good
+        # A large degradation means intervention might have been better
+        acc_change = abs(current_val_acc - pre_val_acc)
+        loss_change = abs(current_val_loss - pre_val_loss)
+        
+        # If metrics got significantly worse, this might indicate we should have intervened
+        # If metrics stayed stable or improved, not intervening was a good choice
+        if current_val_acc > pre_val_acc or current_val_loss < pre_val_loss:
+            # Metrics improved without intervention - good decision
+            reward = 0.5  # Moderate positive reward
+        else:
+            # Metrics worsened - maybe should have intervened
+            if current_val_acc < pre_val_acc - 0.02:
+                # Accuracy got significantly worse - should have intervened
+                reward = 0.05  # Small reward (nearly neutral)
+            else:
+                # Changes were acceptable without intervention
+                reward = 0.2  # Small positive reward
+        
+        logger.info(f"RL reward for non-intervention: {reward:.4f} (acc change: {acc_change:.4f}, "
+                    f"loss change: {loss_change:.4f})")
+        
+        return reward
+    
     def _save_history(self) -> None:
         """Save training history to JSON files."""
         try:
@@ -804,13 +976,16 @@ class ModelTrainer:
         # Finish wandb run if active
         if self.wandb_initialized:
             try:
+                # Use global step for final logging
+                self.global_wandb_step += 1
+                
                 # Log final summary if we haven't already
                 wandb.log({
                     "final_epoch": self.current_epoch + 1,
                     "best_val_acc": self.best_val_acc,
                     "completed": not self.training_interrupted,
                     "early_stopped": self.epochs_without_improvement >= self.early_stopping_patience
-                })
+                }, step=self.global_wandb_step)
                 
                 # Mark run as crashed if training was interrupted
                 if self.training_interrupted:
