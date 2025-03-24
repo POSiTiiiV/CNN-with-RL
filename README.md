@@ -14,6 +14,7 @@ The system uses Proximal Policy Optimization (PPO) from Stable Baselines3 to mak
 - **Reward Normalization**: Uses normalized rewards for stable training
 - **Model Persistence**: Saves the best performing models and can resume training
 - **Customizable Thresholds**: Dynamically adjusts intervention thresholds based on performance
+- **Unified Training Workflow**: Streamlined architecture that uses consistent training methods for both standard training and RL intervention
 
 ## Installation
 
@@ -36,7 +37,9 @@ pip install -r requirements.txt
 - PyTorch
 - Stable Baselines3
 - NumPy
+- Gymnasium 
 - Matplotlib (for visualization)
+- Weights & Biases (optional, for experiment tracking)
 
 ## Project Structure
 
@@ -44,89 +47,126 @@ pip install -r requirements.txt
 CNN-with-RL/
 ├── src/
 │   ├── models/
-│   │   ├── rl_agent.py           # RL-based hyperparameter optimizer
-│   │   ├── cnn_model.py          # CNN implementation
-│   │   └── environment.py        # RL environment for hyperparameter space
-│   ├── utils/
-│   │   ├── data_loader.py        # Data preprocessing utilities
-│   │   └── visualization.py      # Training visualization tools
-│   └── train.py                  # Main training script
-├── notebooks/                    # Experimental Jupyter notebooks
-├── logs/                         # Training logs
-│   └── tensorboard/              # Tensorboard logs
-├── models/                       # Saved models
-│   └── rl_brains/                # Saved RL agent models
-├── tests/                        # Unit tests
-├── data/                         # Dataset storage
-├── configs/                      # Configuration files
-└── README.md                     # This file
+│   │   ├── cnn.py               # CNN model implementation
+│   │   └── rl_agent.py          # RL-based hyperparameter optimizer
+│   ├── trainers/
+│   │   ├── cnn_trainer.py       # CNN training logic
+│   │   └── trainer.py           # Main training coordinator
+│   ├── envs/
+│   │   └── hpo_env.py           # RL environment for hyperparameter optimization
+│   ├── data_loaders/
+│   │   └── data_loader.py       # Data loading and preprocessing utilities
+│   └── utils/
+│       └── utils.py             # Helper functions for observations and metrics
+├── configs/                     # Configuration files
+│   └── default.yaml             # Default configuration
+├── logs/                        # Training logs
+├── models/                      # Saved models
+│   └── rl_brains/               # Saved RL agent models
+├── training_history/            # Training history JSON files
+├── main.py                      # Main entry point
+└── README.md                    # This file
 ```
+
+## Training Workflow
+
+The system implements a unified training workflow that combines CNN training with RL-based hyperparameter optimization:
+
+1. **CNN Training Phase**: The CNN is trained using standard methods, while the RL agent observes the training process.
+
+2. **Performance Monitoring**: During training, the system continuously monitors metrics like validation accuracy, loss trends, and training stability.
+
+3. **Intervention Decisions**: When the RL agent detects stagnation or sub-optimal performance, it decides whether to intervene.
+
+4. **Hyperparameter Adjustment**: If intervention is chosen, the RL agent selects new hyperparameters to improve performance.
+
+5. **Feedback Loop**: The effects of interventions (or non-interventions) are tracked, and rewards are calculated based on subsequent performance changes.
+
+6. **RL Training**: The RL agent learns from these rewards to improve its intervention policy over time.
 
 ## Usage
 
-```python
-from src.models.rl_agent import HyperParameterOptimizer
-from your_environment import YourEnvironment
+### Basic Usage
 
-# Create RL environment
-env = YourEnvironment()
+Run the main training script with default parameters:
 
-# Configuration for the RL agent
-config = {
-    'learning_rate': 3e-4,
-    'n_steps': 1024,
-    'batch_size': 64,
-    'brain_save_dir': 'models/rl_brains'
-}
-
-# Initialize optimizer
-optimizer = HyperParameterOptimizer(env, config)
-
-# Training loop
-for epoch in range(num_epochs):
-    # Get current CNN state/metrics as observation
-    observation = get_current_state()
-    
-    # Get hyperparameter suggestion from RL agent
-    hyperparams = optimizer.optimize_hyperparameters(observation)
-    
-    if hyperparams:
-        # Apply suggested hyperparameters to CNN
-        apply_hyperparameters(cnn_model, hyperparams)
-        intervened = True
-    else:
-        intervened = False
-    
-    # Train CNN for one epoch
-    train_cnn_epoch()
-    
-    # Get new observation and reward
-    new_observation = get_current_state()
-    reward = calculate_performance_improvement()
-    
-    # Train RL agent based on outcome
-    optimizer.learn_from_intervention(new_observation, reward, intervened)
-
-# Save the trained RL agent
-optimizer.save_brain()
+```bash
+python main.py
 ```
 
-## Customization
+### Advanced Options
 
-You can customize the behavior of the RL agent by modifying the configuration parameters:
+```bash
+# Specify configuration file
+python main.py --config configs/custom_config.yaml
 
-```python
-config = {
-    'learning_rate': 3e-4,           # Base learning rate for RL agent
-    'n_steps': 1024,                 # Steps per update
-    'batch_size': 64,                # Minibatch size
-    'gamma': 0.99,                   # Discount factor
-    'train_frequency_min': 5,        # Minimum training frequency
-    'train_frequency_max': 25,       # Maximum training frequency
-    'training_timesteps_min': 5000,  # Minimum training timesteps
-    'training_timesteps_max': 10000, # Maximum training timesteps
-    'intervention_threshold': 0.4    # Initial threshold for intervention
-}
+# Set the data directory
+python main.py --data-dir data/custom_dataset
+
+# Override number of training epochs
+python main.py --epochs 100
+
+# Specify batch size
+python main.py --batch-size 32
+
+# Enable/disable Weights & Biases logging
+python main.py --wandb        # Enable WandB
+python main.py --no-wandb     # Disable WandB
+
+# Resume training from checkpoint
+python main.py --resume logs/checkpoints/checkpoint_epoch_50.pt
+
+# Load pre-trained RL agent
+python main.py --rl-brain models/rl_brains/trained_brain.zip
+
+# Specify training device
+python main.py --device cuda:0   # Use first GPU
+python main.py --device cpu      # Use CPU
+```
+
+## System Components
+
+### CNNTrainer
+
+Responsible for training and evaluating the CNN model using standard deep learning techniques.
+
+### HPOEnvironment
+
+Provides a Gymnasium-compatible environment for the RL agent to interact with. It uses the underlying CNNTrainer to apply hyperparameter changes and get performance metrics.
+
+### HyperParameterOptimizer
+
+RL agent that learns when to intervene and what hyperparameter changes to make. Uses PPO to optimize its policy based on performance rewards.
+
+### ModelTrainer
+
+Coordinates the overall training process, managing the interaction between the CNN trainer and RL optimizer. It decides when to let the RL agent intervene in CNN training.
+
+### Configuration
+
+The system behavior can be customized through the configuration file:
+
+```yaml
+training:
+  max_epochs: 100
+  batch_size: 32
+  early_stopping_patience: 15
+  min_epochs_before_intervention: 10
+  intervention_frequency: 5
+
+rl:
+  learning_rate: 3e-4
+  n_steps: 1024
+  batch_size: 64
+  intervention_threshold: 0.6
+  min_intervention_threshold: 0.3
+  max_intervention_threshold: 0.8
+
+env:
+  max_steps_per_episode: 10
+  epochs_per_step: 1
+  reward_scaling: 10.0
+  exploration_bonus: 0.5
 ```
 
 ## License
