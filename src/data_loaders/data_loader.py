@@ -32,7 +32,7 @@ GLOBAL_IMAGE_CACHE = {}
 def is_memory_critical():
     """Check if system memory is critically low"""
     return psutil.virtual_memory().available < 1 * 1024 * 1024 * 1024  # 1GB threshold
-# TODO: is it using the GPU or not?
+
 class OptimizedFundusDataset(Dataset):
     def __init__(self, df, images_dir, transform=None, cache_images=True, cache_tensors=True, 
                  use_global_cache=True, dataset_type=""):
@@ -349,7 +349,7 @@ def load_dataset(config, data_dir):
     # Adjust settings for Windows to avoid shared memory issues
     if platform.system() == 'Windows':
         # Limit number of workers on Windows to avoid shared memory issues
-        num_workers = min(num_workers, 1)
+        num_workers = min(num_workers, 2)  # Adjusted to 2 for better performance
         logger.info(f"Windows detected: Limiting workers to {num_workers} to avoid shared memory issues")
     
     # Create data loaders with optimized settings

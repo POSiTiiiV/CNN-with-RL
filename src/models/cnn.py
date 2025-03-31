@@ -77,11 +77,23 @@ class PretrainedCNN(nn.Module):
         Args:
             hyperparams: Dictionary containing hyperparameters to update
         """
+        # Log current hyperparameters before update
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.info("Current hyperparameters before RL agent intervention:")
+        for param_name, param_value in self.hyperparams.items():
+            logger.info(f"  {param_name}: {param_value}")
+        
         # Update stored hyperparameter values
         for param, value in hyperparams.items():
             if param in self.hyperparams:
                 self.hyperparams[param] = value
         
+        # Log updated hyperparameters
+        logger.info("Updated hyperparameters after RL agent intervention:")
+        for param_name, param_value in self.hyperparams.items():
+            logger.info(f"  {param_name}: {param_value}")
+            
         # Handle dropout rate changes
         if 'dropout_rate' in hyperparams:
             new_rate = hyperparams['dropout_rate']
@@ -98,8 +110,9 @@ class PretrainedCNN(nn.Module):
             if new_layers != self.fc_layers:
                 self.fc_layers = new_layers
                 
-                # Get backbone output size
-                backbone_output_features = list(self.backbone.modules())[-1].num_features
+                # Get backbone output size - fixed to use the correct way to determine ResNet output features
+                # ResNet34 always has 512 features at the end of the backbone
+                backbone_output_features = 512  # Fixed output size for ResNet34
                 
                 # Build new head
                 head_layers = OrderedDict()

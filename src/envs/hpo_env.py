@@ -3,6 +3,7 @@ import numpy as np
 from gymnasium import spaces
 import math
 import copy
+from collections import deque
 from typing import Dict, List, Tuple, Optional, Any
 import logging
 from ..utils.utils import create_observation, enhance_observation_with_trends, calculate_performance_trends
@@ -32,9 +33,8 @@ class HPOEnvironment(gym.Env):
         self.exploration_bonus = config.get('exploration_bonus', 0.5)
         self.patience = config.get('patience', 3)
         self.intervention_frequency = config.get('intervention_frequency', 5)
-        self.stagnation_epochs = 3  # If val_loss does not improve for 3 epochs, intervene
-        self.stagnation_threshold = 0.001  # Minimal change in val_loss to consider improvement
-
+        self.stagnation_epochs = 3
+        self.stagnation_threshold = 0.001
         
         # Initialize tracking variables
         self.current_step = 0
@@ -52,23 +52,22 @@ class HPOEnvironment(gym.Env):
         }
         self.no_improvement_count = 0
         self.explored_configs = set()
+        self.val_loss_history = deque(maxlen=self.stagnation_epochs)
         
         # Define the action space for hyperparameter tuning
-        # Use MultiDiscrete instead of Dict for compatibility with Stable Baselines3
         self.action_dims = [
             10,  # learning_rate: 10 options
             9,   # dropout_rate: 9 options (0.1 to 0.9)
             8,   # weight_decay: 8 options
             3,   # optimizer_type: 3 options
-            3    # fc_config: 6 different configurations
+            3    # fc_config: 3 different configurations
         ]
         self.action_space = spaces.MultiDiscrete(self.action_dims)
         
         # Define the observation space
-        # This includes normalized metrics and hyperparameter values
         self.observation_space = spaces.Dict({
-            'metrics': spaces.Box(low=0.0, high=1.0, shape=(14,), dtype=np.float32),  # 14 features to track state
-            'hyperparams': spaces.Box(low=0.0, high=1.0, shape=(4,), dtype=np.float32)  # 4 normalized hyperparameters
+            'metrics': spaces.Box(low=0.0, high=1.0, shape=(18,), dtype=np.float32),
+            'hyperparams': spaces.Box(low=0.0, high=1.0, shape=(4,), dtype=np.float32)
         })
         
         # Create mapping from action indices to hyperparameter values
@@ -89,14 +88,6 @@ class HPOEnvironment(gym.Env):
         self.optimizer_types = ['adam', 'sgd', 'adamw']
         
         # FC layer configurations mapping
-        # self.fc_configs = [
-        #     [512, 256],
-        #     [1024, 512],
-        #     [2048, 1024],
-        #     [512, 256, 128],
-        #     [1024, 512, 256],
-        #     [2048, 1024, 512]
-        # ]
         self.fc_configs = [
             [512, 256],       # Small  
             [1024, 512],      # Medium  
@@ -112,7 +103,7 @@ class HPOEnvironment(gym.Env):
             'dropout_rate': float(self.dropout_values[action[1]]),
             'weight_decay': float(self.wd_values[action[2]]),
             'optimizer_type': self.optimizer_types[action[3]],
-            'fc_config': self.fc_configs[action[4]]
+            'fc_layers': self.fc_configs[action[4]]
         }
         
     def _get_observation(self) -> Dict[str, np.ndarray]:
@@ -134,34 +125,54 @@ class HPOEnvironment(gym.Env):
         })
 
     def step(self, action) -> Tuple[Dict[str, np.ndarray], float, bool, bool, Dict[str, Any]]:
+        """
+        Take a step in the environment by applying new hyperparameters and training the CNN.
+        
+        Args:
+            action: The action to take (hyperparameter changes)
+            
+        Returns:
+            Tuple containing:
+                observation (Dict[str, np.ndarray]): The new observation
+                reward (float): The reward for the action
+                terminated (bool): Whether the episode is done
+                truncated (bool): Whether the episode is truncated
+                info (dict): Additional information
+        """
         self.current_step += 1
 
-        # Track last N validation losses to check stagnation
-        self.val_loss_history.append(self.history['val_loss'][-1] if self.history['val_loss'] else float('inf'))
-        if len(self.val_loss_history) > self.stagnation_epochs:
-            self.val_loss_history.popleft()
+        # Track loss history to check stagnation
+        if self.history['val_loss']:
+            self.val_loss_history.append(self.history['val_loss'][-1])
+        
+        # Check for stagnation
+        stagnation_detected = (len(self.val_loss_history) == self.stagnation_epochs and
+                              max(self.val_loss_history) - min(self.val_loss_history) < self.stagnation_threshold)
 
-        # Check if validation loss has stagnated (no significant improvement for N epochs)
-        stagnation_detected = len(self.val_loss_history) == self.stagnation_epochs and \
-                            max(self.val_loss_history) - min(self.val_loss_history) < self.stagnation_threshold
-
-        # RL should intervene **only if stagnation is detected**
+        # Apply new hyperparameters if stagnation is detected
+        is_new_config = False
         if stagnation_detected:
             self.current_hyperparams = self.action_to_hp_dict(action)
             param_hash = self._get_param_hash(self.current_hyperparams)
             is_new_config = param_hash not in self.explored_configs
             self.explored_configs.add(param_hash)
 
-            # Apply new hyperparameters
+            # Apply new hyperparameters using the CNN trainer
             self.cnn_trainer.model.update_hyperparams(self.current_hyperparams)
             self.cnn_trainer.optimizer = self.cnn_trainer.model.get_optimizer()
 
-        # Train for multiple epochs before the next RL decision
+        # Train for the specified number of epochs
+        train_metrics = {}
         for _ in range(self.epochs_per_step):
-            train_loss, train_acc = self.cnn_trainer.train_epoch().values()
-
-        # Evaluate on validation set
-        val_loss, val_acc = self.cnn_trainer.evaluate().values()
+            # Use the existing CNNTrainer's train_epoch method
+            train_metrics = self.cnn_trainer.train_epoch()
+        
+        # Evaluate using the existing CNNTrainer's evaluate method
+        val_metrics = self.cnn_trainer.evaluate()
+        
+        # Extract metrics
+        train_loss, train_acc = train_metrics['loss'], train_metrics['accuracy']
+        val_loss, val_acc = val_metrics['loss'], val_metrics['accuracy']
 
         # Update history
         self.history['val_acc'].append(val_acc)
@@ -275,6 +286,7 @@ class HPOEnvironment(gym.Env):
         # Reset counters and trackers
         self.current_step = 0
         self.no_improvement_count = 0
+        self.val_loss_history.clear()
         
         # Reset to default hyperparameters
         self.current_hyperparams = {
@@ -313,9 +325,11 @@ class HPOEnvironment(gym.Env):
                 self.best_hyperparams = {}
         
         # Initial evaluation to get baseline metrics
-        val_loss, val_acc = self.cnn_trainer.evaluate().values()
-        train_loss = val_loss  # Placeholder until we train
-        train_acc = val_acc    # Placeholder until we train
+        val_metrics = self.cnn_trainer.evaluate()
+        val_loss, val_acc = val_metrics['loss'], val_metrics['accuracy']
+        
+        # Placeholder train metrics until actual training
+        train_loss, train_acc = val_loss, val_acc
         
         # Update history with initial values
         self.history['val_acc'].append(val_acc)

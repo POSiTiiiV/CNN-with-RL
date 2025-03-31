@@ -30,6 +30,11 @@ class CNNTrainer:
         self.learning_rate = config.get('learning_rate', 0.001)
         self.weight_decay = config.get('weight_decay', 0.0001)
         self.optimizer_type = config.get('optimizer_type', 'adam')
+        self.use_mixed_precision = config.get('use_mixed_precision', False)
+        
+        # Initialize mixed precision training if enabled
+        # Use torch.amp instead of torch.cuda.amp (updated API)
+        self.scaler = torch.amp.GradScaler('cuda') if self.use_mixed_precision else None
         
         # Initialize loss function
         self.criterion = torch.nn.BCEWithLogitsLoss()  # Use BCEWithLogitsLoss for multi-label classification
@@ -45,6 +50,14 @@ class CNNTrainer:
         
         # Get device
         self.device = next(model.parameters()).device
+        
+        # Log initial hyperparameters
+        logger.info("Initializing CNNTrainer with hyperparameters:")
+        for param_name, param_value in self.model.hyperparams.items():
+            logger.info(f"  {param_name}: {param_value}")
+        
+        if self.use_mixed_precision:
+            logger.info("Using mixed precision training for better GPU utilization")
         
     def get_optimizer(self):
         """
@@ -87,17 +100,27 @@ class CNNTrainer:
                 # Zero the gradients
                 self.optimizer.zero_grad()
                 
-                # Forward pass
-                outputs = self.model(inputs)
+                # Mixed precision training path
+                if self.use_mixed_precision:
+                    with torch.amp.autocast('cuda'):
+                        # Forward pass with mixed precision
+                        outputs = self.model(inputs)
+                        loss = self.criterion(outputs, targets)
+                    
+                    # Backward pass with gradient scaling
+                    self.scaler.scale(loss).backward()
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
                 
-                # Calculate loss
-                loss = self.criterion(outputs, targets)
-                
-                # Backward pass
-                loss.backward()
-                
-                # Update weights
-                self.optimizer.step()
+                # Standard precision training path
+                else:
+                    # Forward pass
+                    outputs = self.model(inputs)
+                    loss = self.criterion(outputs, targets)
+                    
+                    # Backward pass
+                    loss.backward()
+                    self.optimizer.step()
                 
                 # Update metrics
                 total_loss += loss.item()
@@ -196,4 +219,3 @@ class CNNTrainer:
             'loss': avg_loss,
             'accuracy': accuracy / 100.0  # Return as decimal
         }
- 

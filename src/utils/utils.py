@@ -3,7 +3,7 @@ from typing import Dict, Any
 
 def create_observation(params: Dict[str, Any]) -> Dict[str, np.ndarray]:
     """
-    Create an observation from the current state.
+    Create an observation from the current state with integrated trend data.
     
     Args:
         params: Dictionary containing all required parameters
@@ -20,17 +20,18 @@ def create_observation(params: Dict[str, Any]) -> Dict[str, np.ndarray]:
     no_improvement_count = params['no_improvement_count']
     patience = params['patience']
     
+    # Setup observation arrays (metrics and hyperparams)
     observation = {
-        'metrics': np.zeros(18, dtype=np.float32),  # Updated to 18 to include extra observations
-        'hyperparams': np.zeros(4, dtype=np.float32)
+        'metrics': np.zeros(18, dtype=np.float32),  # Space for all metrics including trends
+        'hyperparams': np.zeros(4, dtype=np.float32)  # Space for normalized hyperparameters
     }
     
     # Current performance metrics
     if history['val_acc']:
         observation['metrics'][0] = history['val_acc'][-1]  # Current val accuracy
         observation['metrics'][1] = min(1.0, max(0.0, 1.0 - history['val_loss'][-1] / 10))  # Normalized val loss
-        observation['metrics'][2] = history['train_acc'][-1] if history['train_acc'] else 0.0
-        observation['metrics'][3] = min(1.0, max(0.0, 1.0 - history['train_loss'][-1] / 10))
+        observation['metrics'][2] = history['train_acc'][-1] if history['train_acc'] else 0.0  # Train accuracy
+        observation['metrics'][3] = min(1.0, max(0.0, 1.0 - history['train_loss'][-1] / 10))  # Normalized train loss
         
     # Best performance so far
     observation['metrics'][4] = best_val_acc
@@ -71,7 +72,7 @@ def create_observation(params: Dict[str, Any]) -> Dict[str, np.ndarray]:
         rel_improvement = (current_acc - last_acc) / max(0.01, last_acc)
         observation['metrics'][8] = min(1.0, max(0.0, rel_improvement + 0.5))  # Scale to [0,1]
 
-    # Add space for extra observations (trend data)
+    # Reserve space for trend data (will be filled by enhance_observation_with_trends)
     observation['metrics'][14] = 0.0  # Placeholder for improvement rate
     observation['metrics'][15] = 0.0  # Placeholder for loss trend
     observation['metrics'][16] = 0.0  # Placeholder for accuracy trend
@@ -90,12 +91,6 @@ def enhance_observation_with_trends(observation: Dict[str, np.ndarray], trend_da
     Returns:
         Enhanced observation dictionary
     """
-    # Ensure we have space for trend data in the metrics part of the observation
-    if len(observation['metrics']) < 18:  # Ensure we have space for trend data
-        extended_metrics = np.zeros(18, dtype=np.float32)
-        extended_metrics[:len(observation['metrics'])] = observation['metrics']
-        observation['metrics'] = extended_metrics
-        
     # Add trend data to observation (normalize to roughly [-1, 1] range)
     observation['metrics'][14] = np.clip(trend_data['improvement_rate'] * 10, -1, 1)  # Overall improvement rate
     observation['metrics'][15] = np.clip(trend_data['val_loss_trend'] * 20, -1, 1)  # Loss trend direction
@@ -115,9 +110,9 @@ def calculate_performance_trends(params: Dict[str, Any]) -> dict:
         dict: Trend data including stagnation status and improvement rates
     """
     history = params['history']
-    metric_window_size = params['metric_window_size']
-    improvement_threshold = params['improvement_threshold']
-    loss_stagnation_threshold = params['loss_stagnation_threshold']
+    metric_window_size = params.get('metric_window_size', 5)
+    improvement_threshold = params.get('improvement_threshold', 0.002)
+    loss_stagnation_threshold = params.get('loss_stagnation_threshold', 0.003)
     
     # Default values if not enough history
     trend_data = {
@@ -159,7 +154,7 @@ def calculate_performance_trends(params: Dict[str, Any]) -> dict:
     
     # Define stagnation: low improvement rate and low volatility
     is_stagnating = (abs(improvement_rate) < improvement_threshold and 
-                      loss_volatility < loss_stagnation_threshold)
+                     loss_volatility < loss_stagnation_threshold)
     
     return {
         'is_stagnating': is_stagnating,

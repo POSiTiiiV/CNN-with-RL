@@ -1,19 +1,22 @@
 # CNN Model Configuration
+verbose: true  # Enable verbose output for detailed logging
+
 model:
   in_channels: 3
   num_classes: 8  # Will be automatically updated based on dataset
   
 # Training Configuration
 training:
-  batch_size: 32  # Reduced batch size for larger images
+  batch_size: 64  # Increased from 32 to better utilize GPU memory
   learning_rate: 0.001
   epochs: 30
-  max_epochs: 100
-  early_stopping_patience: 35
+  max_epochs: 200
+  early_stopping_patience: 100 # TODO: remember to change it back to maybe 30
   checkpoint_frequency: 5
   min_epochs_before_intervention: 5
   intervention_frequency: 5
   stagnation_threshold: 0.005
+  use_mixed_precision: true  # Enable mixed precision training for better GPU utilization
   
 # Reinforcement Learning Configuration
 rl:
@@ -54,7 +57,7 @@ data:
   dataset_name: "custom"  # Changed to use custom dataset
   train_val_split: 0.8
   image_size: 224  # Size for resizing images (suitable for ResNet34)
-  num_workers: 4  # Will be automatically limited to 1 on Windows
+  num_workers: 6  # Increased from 4 to improve data loading throughput
   # Image caching options
   cache_images: false  # Disabled PIL image caching to save memory
   cache_tensors: true  # Cache transformed tensor images (preferred)
@@ -63,7 +66,7 @@ data:
   # DataLoader optimization
   persistent_workers: true # Keep worker processes alive between epochs
   warmup_loaders: true     # Warm up loaders before training starts
-  prefetch_factor: 2       # Number of batches to prefetch per worker
+  prefetch_factor: 4       # Increased from 2 to prefetch more batches per worker
   # Memory management
   max_cache_size_gb: 4     # Maximum cache size in GB
   

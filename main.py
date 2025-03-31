@@ -125,6 +125,10 @@ def get_device(args_device=None):
     if device.type == 'cuda':
         logger.info(f"GPU: {torch.cuda.get_device_name(device)}")
         logger.info(f"GPU Memory: {torch.cuda.get_device_properties(device).total_memory / 1e9:.2f} GB")
+        # Enable performance optimizations for GPU
+        torch.backends.cudnn.benchmark = True  # Enable for consistent input sizes
+        torch.backends.cudnn.deterministic = False  # Allow non-deterministic algorithms for better performance
+        logger.info(f"CUDA optimizations enabled")
     
     return device
 
@@ -139,6 +143,7 @@ def create_model(config, device):
     
     logger.info(f"Created model: {type(model).__name__}")
     logger.info(f"Model config: {config['model']}")
+    logger.info(f"Model device: {next(model.parameters()).device}")
     
     return model
 
@@ -381,3 +386,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+ # while($true) { nvidia-smi; Start-Sleep -Seconds 2; Clear-Host }
