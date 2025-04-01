@@ -171,3 +171,4 @@ logs/
 training_history/
 test.py
 .idea/workspace.xml
+models/
