@@ -3,8 +3,7 @@ import torch
 import logging
 from typing import Dict, Any
 
-# Set up logger
-logger = logging.getLogger("cnn_rl.utils")
+logger = logging.getLogger(__name__)
 
 def create_observation(params: Dict[str, Any]) -> Dict[str, np.ndarray]:
     """
@@ -88,6 +87,8 @@ def create_observation(params: Dict[str, Any]) -> Dict[str, np.ndarray]:
     observation['metrics'][15] = 0.0  # Placeholder for loss trend
     observation['metrics'][16] = 0.0  # Placeholder for accuracy trend
     observation['metrics'][17] = 0.0  # Placeholder for stagnation flag
+    
+    logger.info("Observation created successfully")
     
     return observation
 
@@ -275,5 +276,5 @@ def get_optimizer(model, optimizer_type='adam', learning_rate=0.001, weight_deca
     elif optimizer_type == 'adamw':
         return torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
     else:
-        logger.warning(f"[yellow]Warning: Unknown optimizer type: {optimizer_type}, using Adam[/yellow]")
+        logger.warning("Warning: Unknown optimizer type: {optimizer_type}, using Adam")
         return torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)

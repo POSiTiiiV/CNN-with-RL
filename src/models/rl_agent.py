@@ -1,32 +1,17 @@
 import os
 import time
 import numpy as np
-import logging
 import json
+import logging
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import BaseCallback
 from collections import deque
 from typing import Dict, Any, Optional, List
-from rich.console import Console
-from rich.logging import RichHandler
-from rich.progress import Progress, TextColumn, BarColumn, TimeElapsedColumn, TimeRemainingColumn
-from rich.table import Table
-from rich.panel import Panel
+from tqdm import tqdm
 from io import StringIO
 from ..utils.utils import is_significant_hyperparameter_change
 
-# Set up logger using the consistent approach as in main.py
-logger = logging.getLogger("cnn_rl.rl_agent")
-
-# Create a console for rendering tables
-console = Console(highlight=False)  # Disable syntax highlighting to avoid unexpected color codes
-
-# Set up file logger for tables
-file_logger = logging.getLogger("file_logger")
-file_handler = logging.FileHandler("training.log", encoding="utf-8")
-file_handler.setFormatter(logging.Formatter("%(message)s"))  # Plain text format
-file_logger.addHandler(file_handler)
-file_logger.propagate = False  # Prevent double logging
+logger = logging.getLogger(__name__)
 
 class EvaluationCallback(BaseCallback):
     """
@@ -65,7 +50,7 @@ class ProgressCallback(BaseCallback):
         self.interval = interval
         self.last_log = 0
         self.start_timesteps = 0
-        self.original_level = logging.getLogger().level
+        self.original_level = logger.level
 
     def _on_training_start(self):
         """Initialize progress tracking at the start of training"""
@@ -149,11 +134,11 @@ class HyperParameterOptimizer:
         os.makedirs(self.brain_save_dir, exist_ok=True)
 
         # Initialize PPO agent (always on CPU for stability regardless of GPU availability)
-        logger.info("[bold blue]Initializing PPO agent[/bold blue]")
+        logger.info("Initializing PPO agent")
         self.lr_scheduler = LRScheduler(self.learning_rate)
         
         # Create status message
-        status_message = "[yellow]Creating PPO agent on CPU..."
+        status_message = "Creating PPO agent on CPU..."
         logger.info(status_message)
         
         self.agent = PPO(
@@ -176,7 +161,7 @@ class HyperParameterOptimizer:
         # Connect agent to environment for direct saving
         if hasattr(self.env, 'set_agent'):
             self.env.set_agent(self.agent)
-            logger.info("[green]✓[/green] Agent connected to environment for direct saving")
+            logger.info("Agent connected to environment for direct saving")
 
         # Store most recent action and state for learning
         self.last_state = None
@@ -184,17 +169,17 @@ class HyperParameterOptimizer:
 
         # Load previously collected episodes if available and configured
         if self.auto_load_episodes:
-            logger.info("[yellow]Loading previous episodes...")
+            logger.info("Loading previous episodes...")
             self._load_episodes()
             
             # Train the agent with loaded episodes immediately if we have enough
             if len(self.collected_episodes) >= self.min_episodes_for_training:
-                logger.info(f"[bold green]Found {len(self.collected_episodes)} previously collected episodes.[/bold green] Training RL agent immediately.")
+                logger.info(f"Found {len(self.collected_episodes)} previously collected episodes. Training RL agent immediately.")
                 self._train_agent_with_collected_episodes()
             else:
-                logger.info(f"[yellow]Found {len(self.collected_episodes)} previously collected episodes.[/yellow] Need at least {self.min_episodes_for_training} for training.")
+                logger.info(f"Found {len(self.collected_episodes)} previously collected episodes. Need at least {self.min_episodes_for_training} for training.")
 
-        logger.info("[bold green]✓[/bold green] HyperParameterOptimizer initialized on CPU")
+        logger.info("HyperParameterOptimizer initialized on CPU")
 
     def optimize_hyperparameters(self, observation: Dict[str, np.ndarray], current_hyperparams: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]: 
         """
@@ -212,22 +197,22 @@ class HyperParameterOptimizer:
             # Check for NaN values in observation and replace them
             for key, value in observation.items():
                 if isinstance(value, np.ndarray) and np.isnan(value).any():
-                    logger.warning("[yellow]Warning:[/yellow] Found NaN values in observation key '{key}', replacing with zeros")
+                    logger.warning("Warning: Found NaN values in observation key '{key}', replacing with zeros")
                     observation[key] = np.nan_to_num(value, nan=0.0)
 
             # Get action from PPO agent (intervention decision + hyperparameter changes)
             try:
-                logger.info("[yellow]Querying RL agent for decision...")
+                logger.info("Querying RL agent for decision...")
                 action, _states = self.agent.predict(observation)
             except RuntimeError as e:
                 if "nan" in str(e).lower() or "inf" in str(e).lower():
-                    logger.error(f"[red]Numerical instability in prediction: {e}. Returning no intervention.[/red]")
+                    logger.error(f"Numerical instability in prediction: {e}. Returning no intervention.")
                     return None
                 raise e
             
             # Check for NaN values in the action
             if isinstance(action, np.ndarray) and np.isnan(action).any():
-                logger.error("[red]Action contains NaN values, returning no intervention[/red]")
+                logger.error("Action contains NaN values, returning no intervention")
                 return None
                 
             # Extract intervention score (first action component)
@@ -235,7 +220,7 @@ class HyperParameterOptimizer:
             
             # Additional check for NaN in intervention score
             if np.isnan(intervention_score):
-                logger.error("[red]Intervention score is NaN, returning no intervention[/red]")
+                logger.error("Intervention score is NaN, returning no intervention")
                 return None
                 
             # Track recent scores
@@ -243,11 +228,11 @@ class HyperParameterOptimizer:
             
             # Create a colored indicator for intervention score
             score_color = "green" if intervention_score >= self.intervention_threshold else "yellow"
-            logger.info(f"Intervention score: [{score_color}]{intervention_score:.4f}[/{score_color}] (threshold: {self.intervention_threshold:.4f})")
+            logger.info(f"Intervention score: {intervention_score:.4f} (threshold: {self.intervention_threshold:.4f})")
             
             # If score below threshold, don't intervene
             if intervention_score < self.intervention_threshold:
-                logger.info(f"[yellow]⚠[/yellow] Intervention score below threshold, no intervention needed")
+                logger.info("⚠ Intervention score below threshold, no intervention needed")
                 return None 
 
             # Convert action to hyperparameters
@@ -257,7 +242,7 @@ class HyperParameterOptimizer:
                 
                 # Check for NaN values in action before conversion
                 if any(np.isnan(x) if isinstance(x, (float, np.float32, np.float64)) else False for x in action):
-                    logger.error("[red]NaN values in action, returning no intervention[/red]")
+                    logger.error("NaN values in action, returning no intervention")
                     return None
                 
                 hyperparams = self.env.action_to_hp_dict(action)
@@ -265,7 +250,7 @@ class HyperParameterOptimizer:
                 # Verify hyperparams don't contain NaN values
                 for k, v in hyperparams.items():
                     if isinstance(v, (float, np.float32, np.float64)) and np.isnan(v):
-                        logger.error(f"[red]NaN value in hyperparameter {k}, returning no intervention[/red]")
+                        logger.error(f"NaN value in hyperparameter {k}, returning no intervention")
                         return None
             except Exception as e:
                 logger.exception("Error converting action to hyperparameters")
@@ -276,32 +261,20 @@ class HyperParameterOptimizer:
                 hyperparams.get(key) == current_hyperparams.get(key)
                 for key in set(hyperparams.keys()) | set(current_hyperparams.keys())
             ):
-                logger.warning("[yellow]Proposed hyperparameters are identical to current ones, skipping intervention[/yellow]")
+                logger.warning("Proposed hyperparameters are identical to current ones, skipping intervention")
                 return None
 
-            # Display proposed hyperparameters in a table
-            hp_table = Table(title="Proposed Hyperparameters")
-            hp_table.add_column("Parameter", style="cyan")
-            hp_table.add_column("Value", style="green")
-            
+            print('\n')
+            logger.info("Proposed Hyperparameters:")
+            print('\n')
+
+            # Replace Rich Table with plain logging for proposed hyperparameters
+            logger.info("Proposed Hyperparameters:")
             for param_name, param_value in hyperparams.items():
                 if isinstance(param_value, float):
-                    hp_table.add_row(param_name, f"{param_value:.6f}")
+                    logger.info(f"{param_name}: {param_value:.6f}")
                 else:
-                    hp_table.add_row(param_name, str(param_value))
-            
-            # Display in console
-            console.print(hp_table)
-            
-            # Convert table to plain text for log file
-            buf = StringIO()
-            temp_console = Console(file=buf, force_terminal=False, highlight=False, color_system=None)
-            temp_console.print(hp_table)
-            table_str = buf.getvalue().strip()
-            buf.close()
-            
-            # Log to file
-            file_logger.info("\n" + table_str)
+                    logger.info(f"{param_name}: {param_value}")
 
             # Use centralized utility to check if hyperparameter changes are significant
             if current_hyperparams is not None:
@@ -310,13 +283,13 @@ class HyperParameterOptimizer:
                 )
                 
                 if not is_significant:
-                    logger.warning("[yellow]Proposed hyperparameters too similar to current ones, skipping intervention[/yellow]")
+                    logger.warning("Proposed hyperparameters too similar to current ones, skipping intervention")
                     return None
                 
                 if is_major:
-                    logger.info(f"[bold red]Major hyperparameter change detected:[/bold red] {reason}")
+                    logger.info(f"Major hyperparameter change detected: {reason}")
                 else:
-                    logger.info(f"[bold green]Significant hyperparameter changes detected, proceeding with intervention[/bold green]")
+                    logger.info("Significant hyperparameter changes detected, proceeding with intervention")
     
             return hyperparams
 
@@ -336,13 +309,13 @@ class HyperParameterOptimizer:
         """
         try:
             if not episode_experiences:
-                logger.warning("[yellow]Warning:[/yellow] Empty episode experiences, skipping collection")
+                logger.warning("Warning: Empty episode experiences, skipping collection")
                 return False
                 
             # Store this episode's experiences
             self.collected_episodes.append(episode_experiences)
-            logger.info(f"Collected episode with [cyan]{len(episode_experiences)}[/cyan] experiences. " + 
-                         f"Total episodes: [cyan]{len(self.collected_episodes)}/{self.min_episodes_for_training}[/cyan]")
+            logger.info(f"Collected episode with {len(episode_experiences)} experiences. " + 
+                         f"Total episodes: {len(self.collected_episodes)}/{self.min_episodes_for_training}")
             
             # Keep memory limited
             if len(self.collected_episodes) > self.max_episodes_memory:
@@ -371,7 +344,7 @@ class HyperParameterOptimizer:
             bool: True if training was successful, False otherwise
         """
         if not self.collected_episodes:
-            logger.warning("[yellow]Warning:[/yellow] No episodes to train on")
+            logger.warning("Warning: No episodes to train on")
             return False
             
         # Extract all experiences from collected episodes
@@ -386,7 +359,7 @@ class HyperParameterOptimizer:
             all_rewards.extend(ep_rewards)
                 
         if not all_rewards:
-            logger.warning("[yellow]Warning:[/yellow] No rewards found in collected episodes")
+            logger.warning("Warning: No rewards found in collected episodes")
             return False
             
         # Calculate training statistics
@@ -395,43 +368,31 @@ class HyperParameterOptimizer:
         min_reward = min(all_rewards)
         max_reward = max(all_rewards)
         
-        # Create summary table
-        stats_table = Table(title="Training Statistics")
-        stats_table.add_column("Metric", style="cyan")
-        stats_table.add_column("Value", style="green")
-        stats_table.add_row("Experiences", str(experience_count))
-        stats_table.add_row("Episodes", str(len(self.collected_episodes)))
-        stats_table.add_row("Mean reward", f"{mean_reward:.4f}")
-        stats_table.add_row("Std dev", f"{std_reward:.4f}")
-        stats_table.add_row("Min reward", f"{min_reward:.4f}")
-        stats_table.add_row("Max reward", f"{max_reward:.4f}")
+        print('\n')
+        logger.info("Training Statistics:")
+        print('\n')
+
+        # Replace Rich Table with plain logging for training statistics
+        logger.info("Training Statistics:")
+        logger.info(f"Experiences: {experience_count}")
+        logger.info(f"Episodes: {len(self.collected_episodes)}")
+        logger.info(f"Mean reward: {mean_reward:.4f}")
+        logger.info(f"Std dev: {std_reward:.4f}")
+        logger.info(f"Min reward: {min_reward:.4f}")
+        logger.info(f"Max reward: {max_reward:.4f}")
         
-        # Display in console
-        console.print(stats_table)
-        
-        # Convert table to plain text for log file
-        buf = StringIO()
-        temp_console = Console(file=buf, force_terminal=False, highlight=False, color_system=None)
-        temp_console.print(stats_table)
-        table_str = buf.getvalue().strip()
-        buf.close()
-        
-        # Log to file
-        file_logger.info("\n" + table_str)
-        
-        logger.info("[bold blue]Starting PPO Training")
+        print('\n')
+        logger.info("Starting PPO Training")
+        print('\n')
         
         # Create a progress bar for training
         total_steps = self.training_timesteps
         progress_interval = max(1, total_steps // 40)  # Report progress ~40 times
-        logger.info(f"Training for [cyan]{total_steps}[/cyan] timesteps...")
+        logger.info(f"Training for {total_steps} timesteps...")
         
         # Create a callback for training progress
         progress_callback = ProgressCallback(total_steps, progress_interval)
-        
-        # Ensure any existing live displays are cleared
-        if hasattr(console, '_live') and console._live is not None:
-            console.clear_live()
+
         
         # Train the agent - don't use console.status here as it creates a live display
         # that would conflict with the progress callback's own live display
@@ -441,13 +402,13 @@ class HyperParameterOptimizer:
                 reset_num_timesteps=False,
                 callback=progress_callback
             )
-            logger.info(f"[green]✓[/green] Training completed. Average reward: [cyan]{mean_reward:.4f}[/cyan]")
+            logger.info(f"Training completed. Average reward: {mean_reward:.4f}")
         except Exception as e:
             if "Training ended" in str(e):
-                logger.warning("[yellow]Training ended by callback[/yellow]")
+                logger.warning("Training ended by callback")
             else:
                 logger.exception("Error during training")
-                logger.error(f"[red]Error during training: {str(e)}[/red]")
+                logger.error(f"Error during training: {str(e)}")
                 return False
         
         # Update dynamic parameters based on mean performance
@@ -455,13 +416,13 @@ class HyperParameterOptimizer:
         
         # Save episodes for future use before resetting
         if self.auto_save_episodes:
-            logger.info("[yellow]Saving episodes...")
+            logger.info("Saving episodes...")
             self._save_episodes()
         
         # Save the brain after training with timestamp
         timestamp = int(time.time())
         brain_path = os.path.join(self.brain_save_dir, f"rl_brain_training_{timestamp}.zip")
-        logger.info(f"[yellow]Saving RL brain to {brain_path}...")
+        logger.info(f"Saving RL brain to {brain_path}...")
         self.save_brain(brain_path)
         
         # If this is the best reward we've seen, also save as best_rl_brain
@@ -469,7 +430,7 @@ class HyperParameterOptimizer:
             self.best_reward = mean_reward
             best_brain_path = os.path.join(self.brain_save_dir, "best_rl_brain.zip")
             
-            logger.info("[bold green]Saving best brain...")
+            logger.info("Saving best brain...")
             # Create metadata file with reward info
             metadata = {
                 "best_reward": mean_reward,
@@ -486,7 +447,7 @@ class HyperParameterOptimizer:
             import shutil
             shutil.copy(brain_path, best_brain_path)
             
-            logger.info(f"[bold green]✓[/bold green] New best RL brain saved with reward: [cyan]{mean_reward:.4f}[/cyan]")
+            logger.info(f"New best RL brain saved with reward: {mean_reward:.4f}")
         
         # Reset collection after training
         self.collected_episodes = []
@@ -522,8 +483,8 @@ class HyperParameterOptimizer:
         self.training_timesteps = int(self.training_timesteps_min + 
                                      progress * (self.training_timesteps_max - self.training_timesteps_min))
         
-        logger.info(f"[dim]Updated parameters - Intervention threshold: [cyan]{self.intervention_threshold:.2f}[/cyan], " +
-                    f"Training timesteps: [cyan]{self.training_timesteps}[/cyan][/dim]")
+        logger.info(f"Updated parameters - Intervention threshold: {self.intervention_threshold:.2f}, " +
+                    f"Training timesteps: {self.training_timesteps}")
 
     def update_cnn_epoch(self, epoch: int) -> None:
         """
@@ -573,7 +534,7 @@ class HyperParameterOptimizer:
             with open(metadata_path, 'w') as f:
                 json.dump(metadata, f, indent=2)
                 
-            logger.info(f"[green]✓[/green] Saved RL agent brain to {filepath}")
+            logger.info(f"Saved RL agent brain to {filepath}")
             return filepath
         except Exception as e:
             logger.exception(f"Error saving RL agent brain: {str(e)}")
@@ -591,10 +552,10 @@ class HyperParameterOptimizer:
         """
         try:
             if not os.path.exists(filepath):
-                logger.error(f"[red]RL brain file not found: {filepath}[/red]")
+                logger.error(f"RL brain file not found: {filepath}")
                 return False
                 
-            logger.info(f"[yellow]Loading RL brain from {filepath}...")
+            logger.info(f"Loading RL brain from {filepath}...")
             self.agent = PPO.load(filepath, env=self.env, device="cpu")
             
             # Try to load metadata if available
@@ -608,7 +569,7 @@ class HyperParameterOptimizer:
                 self.training_step = metadata.get('training_step', self.training_step)
                 self.intervention_threshold = metadata.get('intervention_threshold', self.intervention_threshold)
                 
-            logger.info(f"[green]✓[/green] Loaded RL agent brain from {filepath}")
+            logger.info(f"Loaded RL agent brain from {filepath}")
             return True
         except Exception as e:
             logger.exception(f"Error loading RL agent brain: {str(e)}")
@@ -621,7 +582,7 @@ class HyperParameterOptimizer:
         """
         try:
             if not os.path.exists(self.episodes_save_path):
-                logger.warning(f"[yellow]No previous episodes found at {self.episodes_save_path}. Starting with empty episodes collection.[/yellow]")
+                logger.warning(f"No previous episodes found at {self.episodes_save_path}. Starting with empty episodes collection.")
                 return
                 
             with open(self.episodes_save_path, 'r') as f:
@@ -629,7 +590,7 @@ class HyperParameterOptimizer:
                 
             # Check if this is a valid versioned format
             if not isinstance(loaded_data, dict) or "version" not in loaded_data or "episodes" not in loaded_data:
-                logger.warning(f"[yellow]Warning:[/yellow] Episodes file {self.episodes_save_path} has invalid format. Starting with empty episodes.")
+                logger.warning(f"Warning: Episodes file {self.episodes_save_path} has invalid format. Starting with empty episodes.")
                 self.collected_episodes = []
                 return
                 
@@ -642,11 +603,11 @@ class HyperParameterOptimizer:
                 self.intervention_threshold = metadata.get("intervention_threshold", self.intervention_threshold)
                 self.training_timesteps = metadata.get("training_timesteps", self.training_timesteps)
                 
-            logger.info(f"Loaded [cyan]{len(self.collected_episodes)}[/cyan] episodes from {self.episodes_save_path} (format version {loaded_data.get('version', 1)})")
+            logger.info(f"Loaded {len(self.collected_episodes)} episodes from {self.episodes_save_path} (format version {loaded_data.get('version', 1)})")
             
             # Enforce memory limit
             if len(self.collected_episodes) > self.max_episodes_memory:
-                logger.info(f"[yellow]Limiting loaded episodes[/yellow] to the most recent {self.max_episodes_memory} (from {len(self.collected_episodes)} total)")
+                logger.info(f"Limiting loaded episodes to the most recent {self.max_episodes_memory} (from {len(self.collected_episodes)} total)")
                 self.collected_episodes = self.collected_episodes[-self.max_episodes_memory:]
                 
         except Exception as e:
@@ -718,7 +679,7 @@ class HyperParameterOptimizer:
                 
             logger.info(f"Saved {len(self.collected_episodes)} RL training episodes to {self.episodes_save_path}")
         except Exception as e:
-            logger.error(f"[red]Error saving RL training episodes: {str(e)}[/red]")
+            logger.error(f"Error saving RL training episodes: {str(e)}")
             
     def _maintain_episode_history(self, episodes_data):
         """
@@ -762,10 +723,10 @@ class HyperParameterOptimizer:
                 for _, old_file in history_files[:(len(history_files) - max_history_files)]:
                     try:
                         os.remove(old_file)
-                        logger.info(f"[dim]Removed old episodes history file: {old_file}[/dim]")
+                        logger.info(f"Removed old episodes history file: {old_file}")
                     except Exception as e:
-                        logger.warning(f"[yellow]Could not remove old episodes file {old_file}: {e}[/yellow]")
+                        logger.warning(f"Could not remove old episodes file {old_file}: {e}")
                         
         except Exception as e:
-            logger.warning(f"[yellow]Error maintaining episode history: {e}[/yellow]")
+            logger.warning(f"Error maintaining episode history: {e}")
             # Continue execution - this is not critical

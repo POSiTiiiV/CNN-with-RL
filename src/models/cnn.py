@@ -5,13 +5,12 @@ import torch.optim as optim
 from torchvision.models import resnet34, ResNet34_Weights
 from torch.cuda.amp import GradScaler, autocast
 from collections import OrderedDict
-from rich.console import Console
 import logging
+from tqdm import tqdm
 from ..utils.utils import get_optimizer
 
-# Configure Rich console
-console = Console()
-logger = logging.getLogger("cnn_rl.models.cnn")
+# Configure logging
+logger = logging.getLogger(__name__)
 
 class PretrainedCNN(nn.Module):
     def __init__(self, config):

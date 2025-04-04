@@ -11,32 +11,19 @@ import numpy as np
 import time
 import psutil
 import platform
-from rich.console import Console
-from rich.progress import Progress, TextColumn, BarColumn, TimeElapsedColumn, TimeRemainingColumn
-from rich.table import Table
-from rich.text import Text  # Import Text class to strip ANSI codes
+from tqdm import tqdm
 
-# Initialize rich console
-console = Console()
+# Replace Loguru and Rich logging with Python logging and tqdm
+logger = logging.getLogger(__name__)
 
-# Set up logger
-logger = logging.getLogger("cnn_rl.data_loader")
-
-# Log the plain text table to the file (not printed to console)
-file_logger = logging.getLogger("file_logger")
-file_handler = logging.FileHandler("training.log", encoding="utf-8")
-file_handler.setFormatter(logging.Formatter("%(message)s"))  # Plain text format
-file_logger.addHandler(file_handler)
-file_logger.propagate = False  # Prevent it from being logged to console again
-
-# Configure multiprocessing method for Windows to avoid shared memory issues
-if platform.system() == 'Windows':
-    # Set appropriate start method for Windows
-    try:
-        torch.multiprocessing.set_start_method('spawn', force=True)
-        logger.info("[cyan]Set multiprocessing start method to 'spawn' for Windows compatibility[/cyan]")
-    except RuntimeError:
-        logger.warning("[yellow]Multiprocessing start method already set, cannot change now[/yellow]")
+def config_multiprocessing():
+    # Configure multiprocessing method for Windows to avoid shared memory issues
+    if platform.system() == 'Windows':
+        # Set appropriate start method for Windows
+        try:
+            torch.multiprocessing.set_start_method('spawn', force=True)
+        except RuntimeError:
+            logger.warning("Multiprocessing start method already set, cannot change now")
 
 # Global image cache that can be shared between datasets
 GLOBAL_IMAGE_CACHE = {}
@@ -79,16 +66,14 @@ class OptimizedFundusDataset(Dataset):
         # Preload images if caching is enabled
         if self.cache_images and (len(self.images_cache) == 0 or not use_global_cache):
             self._preload_images()
-            
-        # Log cache size
-        if use_global_cache:
-            logger.info(f"Using global image cache with {len(GLOBAL_IMAGE_CACHE)} images")
         
         self.config = {}  # Initialize config dictionary to avoid AttributeError
 
+        config_multiprocessing()  # Configure multiprocessing for Windows
+
     def _preload_images(self):
         """Preload images into cache"""
-        logger.info(f"[bold blue]Preloading images for {self.dataset_type} dataset...[/bold blue]")
+        logger.info(f"Preloading images for {self.dataset_type} dataset...")
         start_time = time.time()
         total = len(self.data)
         
@@ -96,18 +81,10 @@ class OptimizedFundusDataset(Dataset):
         max_cache_size = self.config.get("max_cache_size_gb", 4) * 1024 * 1024 * 1024  # 4GB default
         current_cache_size = 0
         
-        with Progress(
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
-            TextColumn("•"),
-            TimeElapsedColumn()
-        ) as progress:
-            cache_task = progress.add_task(f"[cyan]Caching {self.dataset_type} images", total=total)
-            
+        with tqdm(total=total, desc=f"Caching {self.dataset_type} images", unit="image") as progress:
             for idx in range(total):
                 if idx % 100 == 0 and is_memory_critical():
-                    logger.warning("[yellow]⚠️ System memory critically low. Stopping preloading.[/yellow]")
+                    logger.warning("⚠️ System memory critically low. Stopping preloading.")
                     break
                 
                 row = self.data.iloc[idx]
@@ -119,7 +96,7 @@ class OptimizedFundusDataset(Dataset):
                 
                 # Before adding to cache, check size
                 if current_cache_size > max_cache_size:
-                    logger.warning(f"[yellow]⚠️ Cache size limit reached ({max_cache_size/1e9:.1f}GB). Stopping preloading.[/yellow]")
+                    logger.warning(f"⚠️ Cache size limit reached ({max_cache_size/1e9:.1f}GB). Stopping preloading.")
                     break
                 
                 if cache_key not in self.images_cache:
@@ -138,11 +115,11 @@ class OptimizedFundusDataset(Dataset):
                             # Store without making an unnecessary copy
                             self.images_cache[cache_key] = image
                         
-                        progress.update(cache_task, advance=1)
+                        progress.update(1)
                     except Exception as e:
-                        logger.error(f"[red]Error loading image {img_path}: {str(e)}[/red]")
+                        logger.error(f"Error loading image {img_path}: {str(e)}")
                 else:
-                    progress.update(cache_task, advance=1)
+                    progress.update(1)
                 
                 # After adding to cache
                 if idx % 100 == 0:
@@ -153,7 +130,7 @@ class OptimizedFundusDataset(Dataset):
                         current_cache_size = len(self.tensor_cache) * 602 * 1024
         
         elapsed = time.time() - start_time
-        logger.info(f"[green]✓[/green] [{self.dataset_type}] Completed caching in {elapsed:.2f}s - Images: {len(self.images_cache)}, Tensors: {len(self.tensor_cache)}")
+        logger.info(f"Completed caching in {elapsed:.2f}s - Images: {len(self.images_cache)}, Tensors: {len(self.tensor_cache)}")
 
     def __len__(self):
         return len(self.data)
@@ -175,13 +152,13 @@ class OptimizedFundusDataset(Dataset):
             else:
                 img_path = os.path.join(self.images_dir, row['filename'])
                 if not os.path.exists(img_path):
-                    logger.error(f"[bold red]Image file not found: {img_path}[/bold red]")
+                    logger.error(f"Image file not found: {img_path}")
                     raise FileNotFoundError(f"Image file not found: {img_path}")
                     
                 try:
                     image = Image.open(img_path).convert('RGB')
                 except Exception as e:
-                    logger.error(f"[red]Error loading image {img_path}: {str(e)}[/red]")
+                    logger.error(f"Error loading image {img_path}: {str(e)}")
                     raise Exception(f"Error loading image {img_path}: {str(e)}")
             
             # Apply transform if it wasn't already pre-applied
@@ -213,7 +190,7 @@ def safe_collate(batch):
         return torch.utils.data.dataloader.default_collate(batch)
     except RuntimeError as e:
         if "Couldn't open shared file mapping" in str(e) and platform.system() == 'Windows':
-            logger.warning("[yellow]Warning: Encountered shared memory error, using fallback collate method[/yellow]")
+            logger.warning("Warning: Encountered shared memory error, using fallback collate method")
             # Fallback method - manually stack tensors without shared memory
             images = torch.stack([item[0] for item in batch])
             labels = torch.stack([item[1] for item in batch])
@@ -257,22 +234,23 @@ def get_transform(train=True, image_size=224, minimal=True):
 
 def warmup_dataloader(dataloader, name=""):
     """Warmup dataloader workers by fetching a batch"""
-    logger.info(f"[yellow]Warming up {name} dataloader...[/yellow]")
+    logger.info(f"Warming up {name} dataloader...")
     start_time = time.time()
     try:
-        for i, _ in enumerate(dataloader):
-            logger.debug(f"[dim]Processed batch {i+1}/{min(3, len(dataloader))} for warmup[/dim]")
+        for i, _ in enumerate(tqdm(dataloader, desc=f"Warming up {name} dataloader", total=min(3, len(dataloader)))):
             if i >= 2:  # Process just 3 batches
                 break
         elapsed = time.time() - start_time
-        logger.info(f"[green]✓[/green] {name} DataLoader warmup completed in {elapsed:.2f}s")
+        logger.info(f"{name} DataLoader warmup completed in {elapsed:.2f}s")
     except Exception as e:
-        logger.error(f"[red]Warmup failed: {str(e)}[/red]")
+        logger.error(f"Warmup failed: {str(e)}")
 
 def load_dataset(config, data_dir):
     """Load and prepare the fundus image dataset with optimized performance"""
     start_time = time.time()
-    logger.info("[bold blue]Loading fundus image dataset with highly optimized performance...[/bold blue]")
+    print('\n')
+    logger.info("Loading fundus image dataset with highly optimized performance...")
+    print('\n')
     
     # Get configuration values
     batch_size = config["training"].get("batch_size", 32)
@@ -288,42 +266,26 @@ def load_dataset(config, data_dir):
     # CSV file path
     csv_path = os.path.join(os.path.dirname(data_dir), "csv_files/balanced_full_df.csv")
     if not os.path.exists(csv_path):
-        logger.error(f"[bold red]CSV file not found: {csv_path}[/bold red]")
+        logger.error(f"CSV file not found: {csv_path}")
         raise FileNotFoundError(f"CSV file not found: {csv_path}")
     
+    # Log dataset settings
+    logger.info(f"Dataset Settings:\n"
+                f"CSV file: {csv_path}\n"
+                f"Images directory: {data_dir}\n"
+                f"Batch size: {batch_size}\n"
+                f"Number of workers: {num_workers}\n"
+                f"Image size: {image_size}\n"
+                f"Train/Val split: {train_split:.2f}\n"
+                f"Image caching: {'enabled' if cache_images else 'disabled'}\n"
+                f"Tensor caching: {'enabled' if cache_tensors else 'disabled'}\n"
+                f"Global cache sharing: {'enabled' if use_global_cache else 'disabled'}\n"
+                f"Transformations: {'minimal' if minimal_transform else 'full'}\n"
+                f"Persistent workers: {'enabled' if persistent_workers else 'disabled'}")
     
-    # Create Rich table for console
-    settings_table = Table(title="Dataset Settings")
-    settings_table.add_column("Setting", style="cyan")
-    settings_table.add_column("Value", style="green")
-    
-    # Add rows one by one
-    settings_table.add_row("CSV file", csv_path)
-    settings_table.add_row("Images directory", data_dir)
-    settings_table.add_row("Batch size", str(batch_size))
-    settings_table.add_row("Number of workers", str(num_workers))
-    settings_table.add_row("Image size", str(image_size))
-    settings_table.add_row("Train/Val split", f"{train_split:.2f}")
-    settings_table.add_row("Image caching", "enabled" if cache_images else "disabled")
-    settings_table.add_row("Tensor caching", "enabled" if cache_tensors else "disabled")
-    settings_table.add_row("Global cache sharing", "enabled" if use_global_cache else "disabled")
-    settings_table.add_row("Transformations", "minimal" if minimal_transform else "full")
-    settings_table.add_row("Persistent workers", "enabled" if persistent_workers else "disabled")
-    
-    # Print nicely formatted table in the terminal
-    console.print(settings_table)
-    
-    # Use capture to generate a string
-    with console.capture() as capture:
-        console.print(settings_table)
-    
-    # Convert to plain text without ANSI codes
-    capture_text = Text.from_ansi(capture.get())
-    file_logger.info(f"\n{capture_text}")
-
     # Load the CSV file once
     df = pd.read_csv(csv_path)
-    logger.info(f"[green]✓[/green] CSV loaded: {len(df)} entries in {time.time() - start_time:.2f}s")
+    logger.info(f"CSV loaded: {len(df)} entries in {time.time() - start_time:.2f}s")
     
     # Extract a simple label for stratification
     def get_primary_label(label_str):
@@ -337,7 +299,7 @@ def load_dataset(config, data_dir):
     
     # Split the data into train, val, and test
     split_start = time.time()
-    logger.info("[cyan]Splitting data into train, validation and test sets...[/cyan]")
+    logger.info("Splitting data into train, validation and test sets...")
     train_df, temp_df = train_test_split(
         df,
         train_size=train_split,
@@ -351,14 +313,16 @@ def load_dataset(config, data_dir):
         stratify=temp_df['primary_label'],
         random_state=42
     )
-    logger.info(f"[green]✓[/green] Data split completed in {time.time() - split_start:.2f}s")
+    logger.info(f"Data split completed in {time.time() - split_start:.2f}s")
     
     # Remove temporary column
     train_df = train_df.drop('primary_label', axis=1)
     val_df = val_df.drop('primary_label', axis=1)
     test_df = test_df.drop('primary_label', axis=1)
     
-    logger.info(f"Dataset splits: [blue]{len(train_df)}[/blue] train, [green]{len(val_df)}[/green] val, [yellow]{len(test_df)}[/yellow] test")
+    print('\n')
+    logger.info(f"Dataset splits: {len(train_df)} train, {len(val_df)} val, {len(test_df)} test")
+    print('\n')
     
     # Set up transformations - only apply minimal transformations for preprocessed images
     train_transform = get_transform(train=True, image_size=image_size, minimal=minimal_transform)
@@ -366,7 +330,9 @@ def load_dataset(config, data_dir):
     
     # Create datasets with appropriate transforms and caching
     dataset_start = time.time()
-    logger.info("[bold cyan]Creating datasets...[/bold cyan]")
+    print('\n')
+    logger.info("Creating datasets...")
+    print('\n')
     
     train_dataset = OptimizedFundusDataset(
         train_df, data_dir, transform=train_transform, 
@@ -386,7 +352,7 @@ def load_dataset(config, data_dir):
         use_global_cache=use_global_cache, dataset_type="test"
     )
     
-    logger.info(f"[green]✓[/green] Datasets created in {time.time() - dataset_start:.2f}s")
+    logger.info(f"Datasets created in {time.time() - dataset_start:.2f}s")
     
     # Update model configuration to match dataset
     config["model"]["num_classes"] = len(train_dataset.class_mapping)
@@ -395,11 +361,13 @@ def load_dataset(config, data_dir):
     if platform.system() == 'Windows':
         # Limit number of workers on Windows to avoid shared memory issues
         num_workers = min(num_workers, 2)  # Adjusted to 2 for better performance
-        logger.info(f"[yellow]Windows detected:[/yellow] Limiting workers to {num_workers} to avoid shared memory issues")
+        logger.info(f"Windows detected: Limiting workers to {num_workers} to avoid shared memory issues")
     
     # Create data loaders with optimized settings
     loader_start = time.time()
-    logger.info("[bold cyan]Creating data loaders...[/bold cyan]")
+    print('\n')
+    logger.info("Creating data loaders...")
+    print('\n')
     
     # Use the safe collate function to handle shared memory issues
     train_loader = DataLoader(
@@ -435,16 +403,31 @@ def load_dataset(config, data_dir):
         collate_fn=safe_collate if platform.system() == 'Windows' else None
     )
     
-    logger.info(f"[green]✓[/green] Data loaders created in {time.time() - loader_start:.2f}s")
+    logger.info(f"Data loaders created in {time.time() - loader_start:.2f}s")
     
     # Warmup the dataloaders if configured
     if config["data"].get("warmup_loaders", True) and num_workers > 0:
         warmup_start = time.time()
+        print('\n')
+        logger.info("Warming up train dataloader...")
+        print('\n')
         warmup_dataloader(train_loader, name="train")
+        print('\n')
+        logger.info("Warming up val dataloader...")
+        print('\n')
         warmup_dataloader(val_loader, name="val")
-        logger.info(f"[green]✓[/green] DataLoader warmup completed in {time.time() - warmup_start:.2f}s")
+        print('\n')
+        logger.info("Warming up test dataloader...")
+        print('\n')
+        warmup_dataloader(test_loader, name="test")
+        print('\n')
+        logger.info("DataLoader warmup completed")
+        print('\n')
+        logger.info(f"DataLoader warmup completed in {time.time() - warmup_start:.2f}s")
     
     total_time = time.time() - start_time
-    logger.info(f"[bold green]Total dataset preparation time: {total_time:.2f}s[/bold green]")
+    print('\n')
+    logger.info("Total dataset preparation time: {total_time:.2f}s")
+    print('\n')
     
     return train_loader, val_loader, test_loader

@@ -1,23 +1,10 @@
 import torch
 import logging
-from rich.table import Table
-from rich.progress import Progress, TextColumn, BarColumn, TimeElapsedColumn, TimeRemainingColumn, MofNCompleteColumn
-from rich.console import Console
+from tqdm import tqdm
 from io import StringIO
 from ..utils.utils import get_optimizer
 
-# Initialize Rich console
-console = Console()
-
-# Set up logger
-logger = logging.getLogger("cnn_rl.cnn_trainer")
-
-# Set up file logger for tables
-file_logger = logging.getLogger("file_logger")
-file_handler = logging.FileHandler("training.log", encoding="utf-8")
-file_handler.setFormatter(logging.Formatter("%(message)s"))  # Plain text format
-file_logger.addHandler(file_handler)
-file_logger.propagate = False  # Prevent double logging
+logger = logging.getLogger(__name__)
 
 class CNNTrainer:
     """
@@ -50,7 +37,7 @@ class CNNTrainer:
         # Automatically enable mixed precision for GPU training if not explicitly set
         if torch.cuda.is_available() and self.use_mixed_precision is None:
             self.use_mixed_precision = True
-            logger.info("[green]Automatically enabling mixed precision for GPU training[/green]")
+            logger.info("Automatically enabling mixed precision for GPU training")
         
         # Initialize mixed precision training if enabled
         self.scaler = torch.amp.GradScaler() if self.use_mixed_precision else None
@@ -74,34 +61,20 @@ class CNNTrainer:
         self._check_and_adjust_batch_size()
         
         # Log initial hyperparameters
-        logger.info("[bold blue]Initializing CNNTrainer with hyperparameters:[/bold blue]")
+        logger.info("Initializing CNNTrainer with hyperparameters:")
         
-        # Create a table for hyperparameters
-        hp_table = Table(title="Model Hyperparameters")
-        hp_table.add_column("Parameter", style="cyan")
-        hp_table.add_column("Value", style="green")
-        
+        # Replace Rich Table with plain logging
+        print('\n')
+        logger.info("Model Hyperparameters:")
+        print('\n')
         for param_name, param_value in self.model.hyperparams.items():
             if isinstance(param_value, float):
-                hp_table.add_row(param_name, f"{param_value:.6f}")
+                logger.info(f"{param_name}: {param_value:.6f}")
             else:
-                hp_table.add_row(param_name, str(param_value))
-        
-        # Display in console
-        console.print(hp_table)
-        
-        # Convert table to plain text for log file
-        buf = StringIO()
-        temp_console = Console(file=buf, force_terminal=False, highlight=False, color_system=None)
-        temp_console.print(hp_table)
-        table_str = buf.getvalue().strip()
-        buf.close()
-        
-        # Log to file
-        file_logger.info("\n" + table_str)
-        
+                logger.info(f"{param_name}: {param_value}")
+
         if self.use_mixed_precision:
-            logger.info("[cyan]Using mixed precision training for better GPU utilization[/cyan]")
+            logger.info("Using mixed precision training for better GPU utilization")
             
     def _check_and_adjust_batch_size(self):
         """
@@ -121,9 +94,7 @@ class CNNTrainer:
                 # Calculate free memory (approximate)
                 free_memory = total_memory - allocated_memory - cached_memory
                 
-                logger.info(f"GPU Memory: Total=[cyan]{total_memory:.0f}MB[/cyan], "
-                            f"Free=[green]{free_memory:.0f}MB[/green], "
-                            f"Used=[yellow]{allocated_memory:.0f}MB[/yellow]")
+                logger.info(f"GPU Memory: Total={total_memory:.0f}MB, Free={free_memory:.0f}MB, Used={allocated_memory:.0f}MB")
                 
                 # If free memory is low and batch size is high, reduce batch size
                 if free_memory < 2000 and self.batch_size > 8:  # Threshold of 2GB and batch size > 8
@@ -139,13 +110,13 @@ class CNNTrainer:
                     # Update model hyperparams
                     self.model.hyperparams['batch_size'] = self.batch_size
                     
-                    logger.warning(f"[yellow]⚠️ Reduced batch size from {original_batch_size} to {self.batch_size} due to limited GPU memory[/yellow]")
+                    logger.warning(f"⚠️ Reduced batch size from {original_batch_size} to {self.batch_size} due to limited GPU memory")
                     
                     # Force CUDA cache clear
                     torch.cuda.empty_cache()
                 
             except Exception as e:
-                logger.warning(f"[yellow]Warning: Unable to check GPU memory: {str(e)}[/yellow]")
+                logger.warning(f"Warning: Unable to check GPU memory: {str(e)}")
                 # Continue with original batch size
     
     def get_optimizer(self):
@@ -176,20 +147,8 @@ class CNNTrainer:
         nan_detected = False
         max_grad_norm = 1.0  # Gradient clipping threshold
         
-        # Use Rich progress bar instead of tqdm
-        with Progress(
-            TextColumn("[bold blue]{task.description}"),
-            BarColumn(),
-            MofNCompleteColumn(),
-            TextColumn("•"),
-            TimeElapsedColumn(),
-            TextColumn("•"),
-            TimeRemainingColumn(),
-            TextColumn("[bold]{task.fields[loss]:.4f} loss • {task.fields[acc]:.2f}% acc"),
-            expand=True
-        ) as progress:
-            train_task = progress.add_task("[bold blue]Training", total=len(self.train_loader), loss=0.0, acc=0.0)
-            
+        # Use tqdm progress bar instead of Rich
+        with tqdm(total=len(self.train_loader), desc="Training", unit="batch") as progress:
             for batch_idx, (inputs, targets) in enumerate(self.train_loader):
                 # Try to clear GPU cache if available
                 if hasattr(torch.cuda, 'empty_cache'):
@@ -208,7 +167,7 @@ class CNNTrainer:
                         
                         # Check for NaN in outputs
                         if torch.isnan(outputs).any():
-                            logger.warning(f"[yellow]Warning:[/yellow] NaN detected in model outputs during training at batch {batch_idx}")
+                            logger.warning(f"Warning: NaN detected in model outputs during training at batch {batch_idx}")
                             nan_detected = True
                             # Replace NaN values with zeros to continue computation
                             outputs = torch.nan_to_num(outputs, nan=0.0)
@@ -217,7 +176,7 @@ class CNNTrainer:
                         
                         # Check for NaN in loss
                         if torch.isnan(loss).any():
-                            logger.warning(f"[yellow]Warning:[/yellow] NaN detected in loss during training at batch {batch_idx}")
+                            logger.warning(f"Warning: NaN detected in loss during training at batch {batch_idx}")
                             nan_detected = True
                             # Skip this batch if loss is NaN
                             continue
@@ -233,7 +192,7 @@ class CNNTrainer:
                     skip_step = False
                     for param in self.model.parameters():
                         if param.grad is not None and torch.isnan(param.grad).any():
-                            logger.warning(f"[yellow]Warning:[/yellow] NaN detected in gradients during training at batch {batch_idx}")
+                            logger.warning(f"Warning: NaN detected in gradients during training at batch {batch_idx}")
                             nan_detected = True
                             skip_step = True
                             break
@@ -249,7 +208,7 @@ class CNNTrainer:
                     
                     # Check for NaN in outputs
                     if torch.isnan(outputs).any():
-                        logger.warning(f"[yellow]Warning:[/yellow] NaN detected in model outputs during training at batch {batch_idx}")
+                        logger.warning(f"Warning: NaN detected in model outputs during training at batch {batch_idx}")
                         nan_detected = True
                         # Replace NaN values with zeros to continue computation
                         outputs = torch.nan_to_num(outputs, nan=0.0)
@@ -258,7 +217,7 @@ class CNNTrainer:
                     
                     # Check for NaN in loss
                     if torch.isnan(loss).any():
-                        logger.warning(f"[yellow]Warning:[/yellow] NaN detected in loss during training at batch {batch_idx}")
+                        logger.warning(f"Warning: NaN detected in loss during training at batch {batch_idx}")
                         nan_detected = True
                         # Skip this batch if loss is NaN
                         continue
@@ -273,7 +232,7 @@ class CNNTrainer:
                     skip_step = False
                     for param in self.model.parameters():
                         if param.grad is not None and torch.isnan(param.grad).any():
-                            logger.warning(f"[yellow]Warning:[/yellow] NaN detected in gradients during training at batch {batch_idx}")
+                            logger.warning(f"Warning: NaN detected in gradients during training at batch {batch_idx}")
                             nan_detected = True
                             skip_step = True
                             break
@@ -310,14 +269,15 @@ class CNNTrainer:
                 # Update progress bar
                 avg_loss = total_loss / (batch_idx + 1) if batch_idx >= 0 else 0
                 accuracy = 100. * correct / total if total > 0 else 0
-                progress.update(train_task, advance=1, loss=avg_loss, acc=accuracy)
+                progress.set_postfix(loss=avg_loss, acc=accuracy)
+                progress.update(1)
         
         # Calculate epoch metrics
         if len(self.train_loader) > 0 and not nan_detected:
             avg_loss = total_loss / len(self.train_loader)
         else:
             avg_loss = float('nan')
-            logger.warning("[yellow]Warning:[/yellow] NaN detected in training metrics")
+            logger.warning("Warning: NaN detected in training metrics")
             
         accuracy = 100. * correct / total if total > 0 else 0.0
         
@@ -327,7 +287,7 @@ class CNNTrainer:
         
         # Check if training has gone completely off the rails
         if nan_detected or torch.isnan(torch.tensor(avg_loss)):
-            logger.error("[red]Training has become unstable with NaN values[/red] - the RL agent will be signaled to reduce the learning rate or adjust regularization")
+            logger.error("Training has become unstable with NaN values - the RL agent will be signaled to reduce the learning rate or adjust regularization")
         
         # Return dictionary with metrics (standardized format)
         return {
@@ -352,20 +312,8 @@ class CNNTrainer:
         nan_detected = False
         
         with torch.no_grad():
-            # Use Rich progress bar instead of tqdm
-            with Progress(
-                TextColumn("[bold green]{task.description}"),
-                BarColumn(),
-                MofNCompleteColumn(),
-                TextColumn("•"),
-                TimeElapsedColumn(),
-                TextColumn("•"),
-                TimeRemainingColumn(),
-                TextColumn("[bold]{task.fields[loss]:.4f} loss • {task.fields[acc]:.2f}% acc"),
-                expand=True
-            ) as progress:
-                val_task = progress.add_task("[bold green]Validation", total=len(data_loader), loss=0.0, acc=0.0)
-                
+            # Use tqdm progress bar instead of Rich
+            with tqdm(total=len(data_loader), desc="Validation", unit="batch") as progress:
                 for batch_idx, (inputs, targets) in enumerate(data_loader):
                     # Try to clear GPU cache if available
                     if hasattr(torch.cuda, 'empty_cache'):
@@ -378,7 +326,7 @@ class CNNTrainer:
                     
                     # Check for NaN values in the outputs
                     if torch.isnan(outputs).any():
-                        logger.warning(f"[yellow]Warning:[/yellow] NaN detected in model outputs during evaluation at batch {batch_idx}")
+                        logger.warning(f"Warning: NaN detected in model outputs during evaluation at batch {batch_idx}")
                         nan_detected = True
                         # Replace NaN with zeros for computation to continue
                         outputs = torch.nan_to_num(outputs, nan=0.0)
@@ -388,7 +336,7 @@ class CNNTrainer:
                     
                     # Check for NaN in loss
                     if torch.isnan(loss).any():
-                        logger.warning(f"[yellow]Warning:[/yellow] NaN detected in loss during evaluation at batch {batch_idx}")
+                        logger.warning(f"Warning: NaN detected in loss during evaluation at batch {batch_idx}")
                         nan_detected = True
                         # Use a small positive value instead of NaN for the batch loss
                         batch_loss = 1.0
@@ -422,14 +370,15 @@ class CNNTrainer:
                     # Update progress bar
                     avg_loss = total_loss / (batch_idx + 1)
                     accuracy = 100. * correct / total if total > 0 else 0
-                    progress.update(val_task, advance=1, loss=avg_loss, acc=accuracy)
+                    progress.set_postfix(loss=avg_loss, acc=accuracy)
+                    progress.update(1)
         
         # Calculate metrics
         if len(data_loader) > 0 and not nan_detected:
             avg_loss = total_loss / len(data_loader)
         else:
             avg_loss = float('nan')
-            logger.warning("[yellow]Warning:[/yellow] NaN detected in evaluation metrics")
+            logger.warning("Warning: NaN detected in evaluation metrics")
             
         accuracy = 100. * correct / total if total > 0 else 0.0
         
@@ -439,7 +388,7 @@ class CNNTrainer:
         
         # Check if evaluation has gone completely off the rails
         if nan_detected or torch.isnan(torch.tensor(avg_loss)):
-            logger.error("[red]Model evaluation has unstable NaN values[/red] - the RL agent will be notified to adjust hyperparameters")
+            logger.error("Model evaluation has unstable NaN values - the RL agent will be notified to adjust hyperparameters")
         
         # Return dictionary with metrics (standardized format)
         return {

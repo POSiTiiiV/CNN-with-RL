@@ -8,8 +8,7 @@ import time
 from collections import deque
 from typing import Dict, List, Tuple, Optional, Any
 import logging
-from rich.table import Table
-from rich.console import Console
+from tqdm import tqdm
 from io import StringIO
 from ..utils.utils import (
     create_observation, 
@@ -18,18 +17,8 @@ from ..utils.utils import (
     get_hyperparams_hash
 )
 
-# Set up logger
-logger = logging.getLogger("cnn_rl.hpo_env")
-
-# Create a console for rendering tables
-console = Console(highlight=False, record=False, stderr=False)  # Disable features that may cause conflicts
-
-# Set up file logger for tables
-file_logger = logging.getLogger("file_logger")
-file_handler = logging.FileHandler("training.log", encoding="utf-8")
-file_handler.setFormatter(logging.Formatter("%(message)s"))  # Plain text format
-file_logger.addHandler(file_handler)
-file_logger.propagate = False  # Prevent double logging
+# Create a logger for rendering tables
+logger = logging.getLogger(__name__)
 
 class HPOEnvironment(gym.Env):
     """
@@ -186,7 +175,7 @@ class HPOEnvironment(gym.Env):
                               max(self.val_loss_history) - min(self.val_loss_history) < self.stagnation_threshold)
         
         if stagnation_detected:
-            logger.info(f"[yellow]⚠️[/yellow] Stagnation detected: loss diff {max(self.val_loss_history) - min(self.val_loss_history):.6f} < threshold {self.stagnation_threshold}")
+            logger.info(f"Stagnation detected: loss diff {max(self.val_loss_history) - min(self.val_loss_history):.6f} < threshold {self.stagnation_threshold}")
 
         hyperparams_changed = False
         # Increment steps since last update
@@ -211,7 +200,7 @@ class HPOEnvironment(gym.Env):
                 current_hash = get_hyperparams_hash(self.current_hyperparams) if self.current_hyperparams else None
                 if current_hash != param_hash:
                     self.explored_configs.add(param_hash)
-                    logger.info("[green]Exploring new hyperparameters:[/green]")
+                    logger.info("Exploring new hyperparameters:")
                     for key, value in new_hyperparams.items():
                         logger.info(f"  - {key}: {value}")
 
@@ -245,7 +234,7 @@ class HPOEnvironment(gym.Env):
             val_acc = val_metrics['accuracy']
 
             # Log metrics details
-            logger.info(f"[blue]📊[/blue] Metrics after training:")
+            logger.info("Metrics after training:")
             logger.info(f"  - Train Accuracy: {train_acc:.4f}, Loss: {train_loss:.4f}")
             logger.info(f"  - Val Accuracy: {val_acc:.4f}, Loss: {val_loss:.4f}")
 
@@ -283,13 +272,13 @@ class HPOEnvironment(gym.Env):
         # Log episode end status
         if done:
             if self.current_step >= self.max_steps:
-                logger.info(f"[blue]Episode ended: Max steps ({self.max_steps}) reached[/blue]")
+                logger.info(f"Episode ended: Max steps ({self.max_steps}) reached")
             else:
-                logger.info(f"[yellow]Episode ended: No improvement for {self.no_improvement_count} steps (patience: {self.patience})[/yellow]")
+                logger.info(f"Episode ended: No improvement for {self.no_improvement_count} steps (patience: {self.patience})")
             
             # Calculate and log total episode reward
             episode_reward = sum(self.history['rewards'][-self.current_step:])
-            logger.info(f"[bold]Episode total reward: {episode_reward:.4f}[/bold]")
+            logger.info(f"Episode total reward: {episode_reward:.4f}")
         
         # Get next observation
         observation = self._get_observation()
@@ -334,15 +323,15 @@ class HPOEnvironment(gym.Env):
         }
 
         # Add symbols and new lines to clearly distinguish between steps and episodes
-        logger.info("\n[bold magenta]=====================[/bold magenta]")
-        logger.info(f"[bold magenta]Step {self.current_step}/{self.max_steps}[/bold magenta]")
-        logger.info("[bold magenta]=====================[/bold magenta]\n")
+        logger.info("=====================")
+        logger.info(f"Step {self.current_step}/{self.max_steps}")
+        logger.info("=====================\n")
 
         # At the end of an episode, add a separator
         if done:
-            logger.info("\n[bold cyan]=====================[/bold cyan]")
-            logger.info("[bold cyan]End of Episode[/bold cyan]")
-            logger.info("[bold cyan]=====================[/bold cyan]\n")
+            logger.info("=====================")
+            logger.info("End of Episode")
+            logger.info("=====================\n")
 
         if self.render_mode == 'human':
             self.render()
@@ -370,25 +359,25 @@ class HPOEnvironment(gym.Env):
         if val_acc > self.best_val_acc:
             improvement = val_acc - self.best_val_acc
             reward += self.reward_scaling * improvement
-            logger.info(f"[green]✓[/green] Accuracy improvement: [green]+{improvement:.4f}[/green]")
+            logger.info(f"Accuracy improvement: +{improvement:.4f}")
 
         # Bonus for improvement in validation loss
         if val_loss < self.best_val_loss:
             loss_improvement = self.best_val_loss - val_loss
             reward += self.reward_scaling * loss_improvement
-            logger.info(f"[green]✓[/green] Loss improvement: [green]-{loss_improvement:.4f}[/green]")
+            logger.info(f"Loss improvement: -{loss_improvement:.4f}")
 
         # Exploration bonus (less weight compared to improvements)
         if is_new_config:
             exploration_reward = 0.1 * self.exploration_bonus
             reward += exploration_reward
-            logger.info(f"[blue]🔍[/blue] Exploration bonus: [blue]+{exploration_reward:.4f}[/blue]")
+            logger.info(f"Exploration bonus: +{exploration_reward:.4f}")
 
         # Penalty for no improvement
         if self.no_improvement_count > 0:
             penalty = 0.1 * self.no_improvement_count
             reward -= penalty
-            logger.warning(f"[yellow]⚠️[/yellow] No improvement penalty: [yellow]-{penalty:.4f}[/yellow]")
+            logger.warning(f"No improvement penalty: -{penalty:.4f}")
 
         # Prevent negative rewards
         return max(0, reward)
@@ -400,75 +389,37 @@ class HPOEnvironment(gym.Env):
         if not self.render_mode:
             return
 
-        logger.info(f"[bold blue]HPO Environment - Step {self.current_step}/{self.max_steps}")
+        logger.info(f"HPO Environment - Step {self.current_step}/{self.max_steps}")
         
-        # Display hyperparameters table
-        hp_table = Table(title="Current Hyperparameters")
-        hp_table.add_column("Parameter", style="cyan")
-        hp_table.add_column("Value", style="yellow")
-        
+        # Replace Rich Table with plain logging for hyperparameters
+        print('\n')
+        logger.info("Current Hyperparameters:")
+        print('\n')
         for name, value in self.current_hyperparams.items():
             if isinstance(value, float):
-                hp_table.add_row(name, f"{value:.6f}")
+                logger.info(f"{name}: {value:.6f}")
             else:
-                hp_table.add_row(name, str(value))
-        
-        # Display in console and log to file
-        console.print(hp_table)
-        
-        # Convert table to plain text for log file
-        buf = StringIO()
-        temp_console = Console(file=buf, force_terminal=False, highlight=False, color_system=None)
-        temp_console.print(hp_table)
-        table_str = buf.getvalue().strip()
-        buf.close()
-        
-        # Log to file
-        file_logger.info("\n" + table_str)
+                logger.info(f"{name}: {value}")
 
+        # Replace Rich Table for performance metrics with plain logging
         if self.history['val_acc']:
-            # Create performance metrics table
-            metrics_table = Table(title="Performance Metrics")
-            metrics_table.add_column("Metric", style="cyan")
-            metrics_table.add_column("Current", style="green")
-            metrics_table.add_column("Best", style="yellow")
-            
-            metrics_table.add_row("Val Accuracy", 
-                                f"{self.history['val_acc'][-1]:.4f}", 
-                                f"{self.best_val_acc:.4f}")
-            metrics_table.add_row("Val Loss", 
-                                f"{self.history['val_loss'][-1]:.4f}", 
-                                f"{self.best_val_loss:.4f}")
-            
+            print('\n')
+            logger.info("Performance Metrics:")
+            print('\n')
+            logger.info(f"Val Accuracy: Current: {self.history['val_acc'][-1]:.4f}, Best: {self.best_val_acc:.4f}")
+            logger.info(f"Val Loss: Current: {self.history['val_loss'][-1]:.4f}, Best: {self.best_val_loss:.4f}")
             if len(self.history['train_acc']) > 0:
-                metrics_table.add_row("Train Accuracy", 
-                                    f"{self.history['train_acc'][-1]:.4f}", 
-                                    f"{self.best_train_acc:.4f}")
-                metrics_table.add_row("Train Loss", 
-                                    f"{self.history['train_loss'][-1]:.4f}", 
-                                    f"{self.best_train_loss:.4f}")
-            
-            # Display in console
-            console.print(metrics_table)
-            
-            # Convert table to plain text for log file
-            buf = StringIO()
-            temp_console = Console(file=buf, force_terminal=False, highlight=False, color_system=None)
-            temp_console.print(metrics_table)
-            table_str = buf.getvalue().strip()
-            buf.close()
-            
-            # Log to file
-            file_logger.info("\n" + table_str)
+                logger.info(f"Train Accuracy: Current: {self.history['train_acc'][-1]:.4f}, Best: {self.best_train_acc:.4f}")
+                logger.info(f"Train Loss: Current: {self.history['train_loss'][-1]:.4f}, Best: {self.best_train_loss:.4f}")
         
         # Display reward
         if self.history['rewards']:
             reward = self.history['rewards'][-1]
             reward_color = "green" if reward > 0 else "red"
-            logger.info(f"[bold]Reward:[/bold] [{reward_color}]{reward:.4f}[/{reward_color}]")
+            logger.info(f"Reward: {reward:.4f}")
         
         # Show no improvement counter
-        improvement_status = "[green]Good" if self.no_improvement_count < self.patience // 2 else "[yellow]Concerning" if self.no_improvement_count < self.patience else "[red]Critical"
+        improvement_status = "Good" if self.no_improvement_count < self.patience // 2 else "Concerning" if self.no_improvement_count < self.patience else "Critical"
         logger.info(f"Steps without improvement: {self.no_improvement_count}/{self.patience} ({improvement_status})")
 
     def reset(self, seed=None, options=None) -> Tuple[Dict[str, np.ndarray], Dict[str, Any]]:
@@ -499,7 +450,7 @@ class HPOEnvironment(gym.Env):
         # Get initial hyperparameters - either use default or get from options
         if options and 'hyperparams' in options:
             self.current_hyperparams = options['hyperparams']
-            logger.info(f"[blue]ℹ[/blue] Reset environment with provided hyperparameters: {get_hyperparams_hash(self.current_hyperparams)}")
+            logger.info(f"Reset environment with provided hyperparameters: {get_hyperparams_hash(self.current_hyperparams)}")
         elif not self.current_hyperparams or bad_previous_run:  # Reset if not set or previous run was bad
             # Use default hyperparameters
             self.current_hyperparams = {
@@ -510,10 +461,10 @@ class HPOEnvironment(gym.Env):
                 'fc_layers': [1024, 512]
             }
             if bad_previous_run:
-                logger.info(f"[yellow]⚠️[/yellow] Previous run reached patience limit. Resetting hyperparameters.")
-            logger.info(f"[blue]ℹ[/blue] Reset environment with default hyperparameters: {get_hyperparams_hash(self.current_hyperparams)}")
+                logger.info(f"Previous run reached patience limit. Resetting hyperparameters.")
+            logger.info(f"Reset environment with default hyperparameters: {get_hyperparams_hash(self.current_hyperparams)}")
         else:
-            logger.info(f"[blue]ℹ[/blue] Keeping existing hyperparameters during reset: {get_hyperparams_hash(self.current_hyperparams)}")
+            logger.info(f"Keeping existing hyperparameters during reset: {get_hyperparams_hash(self.current_hyperparams)}")
         
         # Apply hyperparameters to the model
         self.cnn_trainer.model.update_hyperparams(self.current_hyperparams)
@@ -572,7 +523,9 @@ class HPOEnvironment(gym.Env):
         }
         
         if self.render_mode == 'human':
-            logger.info("[bold blue]Environment reset[/bold blue]")
+            print('\n')
+            logger.info("Environment reset")
+            print('\n')
             self.render()
             
         return observation, info
@@ -588,7 +541,7 @@ class HPOEnvironment(gym.Env):
             str: Path to the saved brain file
         """
         if not hasattr(self, 'agent') or not hasattr(self.agent, 'save'):
-            logger.warning("[yellow]Warning: Environment has no agent attribute with save method[/yellow]")
+            logger.warning("Warning: Environment has no agent attribute with save method")
             return None
             
         try:
@@ -597,16 +550,16 @@ class HPOEnvironment(gym.Env):
             # Different naming for best brains
             if best:
                 filename = "hpo_env_best_brain.zip"
-                logger.info(f"[bold green]Saving best RL brain with episode reward: {self.best_episode_reward:.4f}[/bold green]")
+                logger.info(f"Saving best RL brain with episode reward: {self.best_episode_reward:.4f}")
             else:
                 filename = f"hpo_env_brain_step_{self.total_steps}.zip"
-                logger.info(f"[green]Saving periodic RL brain at step {self.total_steps}[/green]")
+                logger.info(f"Saving periodic RL brain at step {self.total_steps}")
             
             # Full path
             brain_path = os.path.join(self.brain_save_dir, filename)
             
             # Save the brain
-            logger.info(f"[yellow]Saving brain to {brain_path}...[/yellow]")
+            logger.info(f"Saving brain to {brain_path}...")
             self.agent.save(brain_path)
             
             # Save metadata
@@ -632,7 +585,7 @@ class HPOEnvironment(gym.Env):
             with open(metadata_path, 'w') as f:
                 json.dump(metadata, f, indent=2)
                 
-            logger.info(f"[green]✓[/green] Brain saved to {brain_path}")
+            logger.info(f"Brain saved to {brain_path}")
             return brain_path
             
         except Exception as e:
@@ -648,4 +601,4 @@ class HPOEnvironment(gym.Env):
             agent: The RL agent to use
         """
         self.agent = agent
-        logger.info("[green]✓[/green] RL agent set in HPO environment")
+        logger.info("RL agent set in HPO environment")
