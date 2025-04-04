@@ -3,12 +3,33 @@ import numpy as np
 from gymnasium import spaces
 import math
 import copy
+import os
+import time
 from collections import deque
 from typing import Dict, List, Tuple, Optional, Any
 import logging
-from ..utils.utils import create_observation, enhance_observation_with_trends, calculate_performance_trends
+from rich.table import Table
+from rich.console import Console
+from io import StringIO
+from ..utils.utils import (
+    create_observation, 
+    enhance_observation_with_trends, 
+    calculate_performance_trends, 
+    get_hyperparams_hash
+)
 
-logger = logging.getLogger(__name__)
+# Set up logger
+logger = logging.getLogger("cnn_rl.hpo_env")
+
+# Create a console for rendering tables
+console = Console(highlight=False, record=False, stderr=False)  # Disable features that may cause conflicts
+
+# Set up file logger for tables
+file_logger = logging.getLogger("file_logger")
+file_handler = logging.FileHandler("training.log", encoding="utf-8")
+file_handler.setFormatter(logging.Formatter("%(message)s"))  # Plain text format
+file_logger.addHandler(file_handler)
+file_logger.propagate = False  # Prevent double logging
 
 class HPOEnvironment(gym.Env):
     """
@@ -31,16 +52,26 @@ class HPOEnvironment(gym.Env):
         self.epochs_per_step = config.get('epochs_per_step', 1)
         self.reward_scaling = config.get('reward_scaling', 10.0)
         self.exploration_bonus = config.get('exploration_bonus', 0.5)
-        self.patience = config.get('patience', 3)
+        self.patience = self.config.get('patience', 6)  # Default to 10 steps
         self.intervention_frequency = config.get('intervention_frequency', 5)
         self.stagnation_epochs = 3
-        self.stagnation_threshold = 0.001
+        self.stagnation_threshold = self.config.get('stagnation_threshold', 0.01)  # Default to 0.01
+        
+        # Save RL brain configuration
+        self.brain_save_dir = config.get('brain_save_dir', 'models/rl_brains')
+        self.brain_save_steps = config.get('brain_save_steps', 50)
+        self.last_save_step = 0
+        self.total_steps = 0
+        self.best_episode_reward = -float('inf')
+        os.makedirs(self.brain_save_dir, exist_ok=True)
         
         # Initialize tracking variables
         self.current_step = 0
         self.current_hyperparams = {}
         self.best_val_acc = 0.0
         self.best_val_loss = float('inf')
+        self.best_train_acc = 0.0  # Add tracking for best training accuracy
+        self.best_train_loss = float('inf')  # Add tracking for best training loss
         self.best_hyperparams = {}
         self.history = {
             'val_acc': [],
@@ -72,6 +103,10 @@ class HPOEnvironment(gym.Env):
         
         # Create mapping from action indices to hyperparameter values
         self._create_action_mappings()
+
+        # Introduce a minimum training period before allowing hyperparameter updates
+        self.min_training_steps = self.config.get('min_training_steps', 10)  # Default to 10 steps
+        self.steps_since_last_update = 0  # Track steps since the last hyperparameter update
         
     def _create_action_mappings(self):
         """Create mappings between action indices and actual hyperparameter values"""
@@ -140,6 +175,7 @@ class HPOEnvironment(gym.Env):
                 info (dict): Additional information
         """
         self.current_step += 1
+        self.total_steps += 1
 
         # Track loss history to check stagnation
         if self.history['val_loss']:
@@ -148,38 +184,76 @@ class HPOEnvironment(gym.Env):
         # Check for stagnation
         stagnation_detected = (len(self.val_loss_history) == self.stagnation_epochs and
                               max(self.val_loss_history) - min(self.val_loss_history) < self.stagnation_threshold)
+        
+        if stagnation_detected:
+            logger.info(f"[yellow]⚠️[/yellow] Stagnation detected: loss diff {max(self.val_loss_history) - min(self.val_loss_history):.6f} < threshold {self.stagnation_threshold}")
 
-        # Apply new hyperparameters if stagnation is detected
+        hyperparams_changed = False
+        # Increment steps since last update
+        self.steps_since_last_update += 1
+
+        # Initialize is_new_config to False to ensure it is always defined
         is_new_config = False
-        if stagnation_detected:
-            self.current_hyperparams = self.action_to_hp_dict(action)
-            param_hash = self._get_param_hash(self.current_hyperparams)
+
+        # Ensure RL agent explores new hyperparameters
+        # Modify the logic to encourage exploration
+        if stagnation_detected and self.steps_since_last_update >= self.min_training_steps:
+            # Convert action to hyperparameters
+            new_hyperparams = self.action_to_hp_dict(action)
+
+            # Use centralized utility to check if hyperparams are new
+            param_hash = get_hyperparams_hash(new_hyperparams)
             is_new_config = param_hash not in self.explored_configs
-            self.explored_configs.add(param_hash)
 
-            # Apply new hyperparameters using the CNN trainer
-            self.cnn_trainer.model.update_hyperparams(self.current_hyperparams)
-            self.cnn_trainer.optimizer = self.cnn_trainer.model.get_optimizer()
+            # Check if they're actually different from current hyperparams
+            if is_new_config:
+                # Compare with current hyperparameters
+                current_hash = get_hyperparams_hash(self.current_hyperparams) if self.current_hyperparams else None
+                if current_hash != param_hash:
+                    self.explored_configs.add(param_hash)
+                    logger.info("[green]Exploring new hyperparameters:[/green]")
+                    for key, value in new_hyperparams.items():
+                        logger.info(f"  - {key}: {value}")
 
-        # Train for the specified number of epochs
-        train_metrics = {}
-        for _ in range(self.epochs_per_step):
-            # Use the existing CNNTrainer's train_epoch method
-            train_metrics = self.cnn_trainer.train_epoch()
-        
-        # Evaluate using the existing CNNTrainer's evaluate method
-        val_metrics = self.cnn_trainer.evaluate()
-        
-        # Extract metrics
-        train_loss, train_acc = train_metrics['loss'], train_metrics['accuracy']
-        val_loss, val_acc = val_metrics['loss'], val_metrics['accuracy']
+                    self.current_hyperparams = new_hyperparams
+                    self.cnn_trainer.model.update_hyperparams(self.current_hyperparams)
+                    self.cnn_trainer.optimizer = self.cnn_trainer.model.get_optimizer()
+                    hyperparams_changed = True
+                    self.steps_since_last_update = 0  # Reset the counter after an update
+                else:
+                    logger.debug("Generated hyperparameters are equivalent to current ones, not counted as new")
 
-        # Update history
-        self.history['val_acc'].append(val_acc)
-        self.history['val_loss'].append(val_loss)
-        self.history['train_acc'].append(train_acc)
-        self.history['train_loss'].append(train_loss)
-        if stagnation_detected:
+        # Remove functionality to skip training and validation
+        # Always perform training and validation regardless of hyperparameter changes
+        hyperparams_changed = True  # Force training and validation to always occur
+
+        # Training and evaluation can be separate operations
+        if hyperparams_changed:
+            # Train for the specified number of epochs using the CNNTrainer
+            train_metrics = None
+            for _ in range(self.epochs_per_step):
+                # Use CNNTrainer's train_epoch method
+                train_metrics = self.cnn_trainer.train_epoch()
+
+            # Evaluate using CNNTrainer's evaluate method
+            val_metrics = self.cnn_trainer.evaluate()
+
+            # Extract metrics
+            train_loss = train_metrics['loss']
+            train_acc = train_metrics['accuracy']
+            val_loss = val_metrics['loss']
+            val_acc = val_metrics['accuracy']
+
+            # Log metrics details
+            logger.info(f"[blue]📊[/blue] Metrics after training:")
+            logger.info(f"  - Train Accuracy: {train_acc:.4f}, Loss: {train_loss:.4f}")
+            logger.info(f"  - Val Accuracy: {val_acc:.4f}, Loss: {val_loss:.4f}")
+
+            # Update history
+            self.history['val_acc'].append(val_acc)
+            self.history['val_loss'].append(val_loss)
+            self.history['train_acc'].append(train_acc)
+            self.history['train_loss'].append(train_loss)
             self.history['hyperparams'].append(copy.deepcopy(self.current_hyperparams))
 
         # Calculate reward
@@ -196,10 +270,27 @@ class HPOEnvironment(gym.Env):
             improved = True
         else:
             self.no_improvement_count += 1
+            
+        # Update best training metrics
+        if train_acc > self.best_train_acc:
+            self.best_train_acc = train_acc
+        if train_loss < self.best_train_loss:
+            self.best_train_loss = train_loss
 
         # Check if episode is done
         done = (self.current_step >= self.max_steps) or (self.no_improvement_count >= self.patience)
-
+        
+        # Log episode end status
+        if done:
+            if self.current_step >= self.max_steps:
+                logger.info(f"[blue]Episode ended: Max steps ({self.max_steps}) reached[/blue]")
+            else:
+                logger.info(f"[yellow]Episode ended: No improvement for {self.no_improvement_count} steps (patience: {self.patience})[/yellow]")
+            
+            # Calculate and log total episode reward
+            episode_reward = sum(self.history['rewards'][-self.current_step:])
+            logger.info(f"[bold]Episode total reward: {episode_reward:.4f}[/bold]")
+        
         # Get next observation
         observation = self._get_observation()
 
@@ -211,6 +302,17 @@ class HPOEnvironment(gym.Env):
             'loss_stagnation_threshold': self.config.get('loss_stagnation_threshold', 0.003)
         })
         observation = enhance_observation_with_trends(observation, trend_data)
+
+        # Save brain periodically during training
+        if self.total_steps - self.last_save_step >= self.brain_save_steps:
+            self.save_agent_brain()
+            self.last_save_step = self.total_steps
+        
+        # Check if this is the best episode reward so far and save special brain if it is
+        episode_reward = sum(self.history['rewards'][-self.current_step:])
+        if done and episode_reward > self.best_episode_reward:
+            self.best_episode_reward = episode_reward
+            self.save_agent_brain(best=True)
 
         # Create info dictionary
         info = {
@@ -225,8 +327,22 @@ class HPOEnvironment(gym.Env):
             'improved': improved,
             'steps_without_improvement': self.no_improvement_count,
             'is_new_config': is_new_config,
-            'stagnation_detected': stagnation_detected
+            'stagnation_detected': stagnation_detected,
+            'hyperparams_changed': hyperparams_changed,
+            'total_steps': self.total_steps,
+            'episode_reward': episode_reward
         }
+
+        # Add symbols and new lines to clearly distinguish between steps and episodes
+        logger.info("\n[bold magenta]=====================[/bold magenta]")
+        logger.info(f"[bold magenta]Step {self.current_step}/{self.max_steps}[/bold magenta]")
+        logger.info("[bold magenta]=====================[/bold magenta]\n")
+
+        # At the end of an episode, add a separator
+        if done:
+            logger.info("\n[bold cyan]=====================[/bold cyan]")
+            logger.info("[bold cyan]End of Episode[/bold cyan]")
+            logger.info("[bold cyan]=====================[/bold cyan]\n")
 
         if self.render_mode == 'human':
             self.render()
@@ -249,161 +365,287 @@ class HPOEnvironment(gym.Env):
         reward = math.log(1 + val_acc) - 0.1 * val_loss  
 
         # Bonus for improvement in validation accuracy
+        improvement = 0
+        loss_improvement = 0
         if val_acc > self.best_val_acc:
             improvement = val_acc - self.best_val_acc
             reward += self.reward_scaling * improvement
+            logger.info(f"[green]✓[/green] Accuracy improvement: [green]+{improvement:.4f}[/green]")
 
         # Bonus for improvement in validation loss
         if val_loss < self.best_val_loss:
             loss_improvement = self.best_val_loss - val_loss
             reward += self.reward_scaling * loss_improvement
+            logger.info(f"[green]✓[/green] Loss improvement: [green]-{loss_improvement:.4f}[/green]")
 
         # Exploration bonus (less weight compared to improvements)
         if is_new_config:
-            reward += 0.1 * self.exploration_bonus
+            exploration_reward = 0.1 * self.exploration_bonus
+            reward += exploration_reward
+            logger.info(f"[blue]🔍[/blue] Exploration bonus: [blue]+{exploration_reward:.4f}[/blue]")
 
         # Penalty for no improvement
-        reward -= 0.1 * self.no_improvement_count
+        if self.no_improvement_count > 0:
+            penalty = 0.1 * self.no_improvement_count
+            reward -= penalty
+            logger.warning(f"[yellow]⚠️[/yellow] No improvement penalty: [yellow]-{penalty:.4f}[/yellow]")
 
         # Prevent negative rewards
         return max(0, reward)
 
-    def reset(self, seed: Optional[int] = None, options: Optional[dict] = None) -> Tuple[Dict[str, np.ndarray], Dict[str, Any]]:
+    def render(self):
         """
-        Reset the environment to start a new episode.
+        Render the current state of the environment with Rich formatting.
+        """
+        if not self.render_mode:
+            return
+
+        logger.info(f"[bold blue]HPO Environment - Step {self.current_step}/{self.max_steps}")
+        
+        # Display hyperparameters table
+        hp_table = Table(title="Current Hyperparameters")
+        hp_table.add_column("Parameter", style="cyan")
+        hp_table.add_column("Value", style="yellow")
+        
+        for name, value in self.current_hyperparams.items():
+            if isinstance(value, float):
+                hp_table.add_row(name, f"{value:.6f}")
+            else:
+                hp_table.add_row(name, str(value))
+        
+        # Display in console and log to file
+        console.print(hp_table)
+        
+        # Convert table to plain text for log file
+        buf = StringIO()
+        temp_console = Console(file=buf, force_terminal=False, highlight=False, color_system=None)
+        temp_console.print(hp_table)
+        table_str = buf.getvalue().strip()
+        buf.close()
+        
+        # Log to file
+        file_logger.info("\n" + table_str)
+
+        if self.history['val_acc']:
+            # Create performance metrics table
+            metrics_table = Table(title="Performance Metrics")
+            metrics_table.add_column("Metric", style="cyan")
+            metrics_table.add_column("Current", style="green")
+            metrics_table.add_column("Best", style="yellow")
+            
+            metrics_table.add_row("Val Accuracy", 
+                                f"{self.history['val_acc'][-1]:.4f}", 
+                                f"{self.best_val_acc:.4f}")
+            metrics_table.add_row("Val Loss", 
+                                f"{self.history['val_loss'][-1]:.4f}", 
+                                f"{self.best_val_loss:.4f}")
+            
+            if len(self.history['train_acc']) > 0:
+                metrics_table.add_row("Train Accuracy", 
+                                    f"{self.history['train_acc'][-1]:.4f}", 
+                                    f"{self.best_train_acc:.4f}")
+                metrics_table.add_row("Train Loss", 
+                                    f"{self.history['train_loss'][-1]:.4f}", 
+                                    f"{self.best_train_loss:.4f}")
+            
+            # Display in console
+            console.print(metrics_table)
+            
+            # Convert table to plain text for log file
+            buf = StringIO()
+            temp_console = Console(file=buf, force_terminal=False, highlight=False, color_system=None)
+            temp_console.print(metrics_table)
+            table_str = buf.getvalue().strip()
+            buf.close()
+            
+            # Log to file
+            file_logger.info("\n" + table_str)
+        
+        # Display reward
+        if self.history['rewards']:
+            reward = self.history['rewards'][-1]
+            reward_color = "green" if reward > 0 else "red"
+            logger.info(f"[bold]Reward:[/bold] [{reward_color}]{reward:.4f}[/{reward_color}]")
+        
+        # Show no improvement counter
+        improvement_status = "[green]Good" if self.no_improvement_count < self.patience // 2 else "[yellow]Concerning" if self.no_improvement_count < self.patience else "[red]Critical"
+        logger.info(f"Steps without improvement: {self.no_improvement_count}/{self.patience} ({improvement_status})")
+
+    def reset(self, seed=None, options=None) -> Tuple[Dict[str, np.ndarray], Dict[str, Any]]:
+        """
+        Reset the environment to its initial state.
         
         Args:
-            seed: Random seed
-            options: Additional options for reset
+            seed: Seed for random number generator
+            options: Additional options
             
         Returns:
             Tuple containing:
-                observation (Dict[str, np.ndarray]): Initial observation
+                observation (Dict[str, np.ndarray]): The initial observation
                 info (dict): Additional information
         """
-        super().reset(seed=seed)
+        # Set seed if provided
+        if seed is not None:
+            np.random.seed(seed)
+            
+        # Check if the previous run was bad (reached patience limit without improvement)
+        bad_previous_run = self.no_improvement_count >= self.patience
         
-        # Reset counters and trackers
+        # Reset training state
         self.current_step = 0
         self.no_improvement_count = 0
         self.val_loss_history.clear()
         
-        # Reset to default hyperparameters
-        self.current_hyperparams = {
-            'learning_rate': 0.001,
-            'weight_decay': 1e-4,
-            'dropout_rate': 0.5,
-            'fc_layers': [512, 256],
-            'optimizer_type': 'adam'
-        }
+        # Get initial hyperparameters - either use default or get from options
+        if options and 'hyperparams' in options:
+            self.current_hyperparams = options['hyperparams']
+            logger.info(f"[blue]ℹ[/blue] Reset environment with provided hyperparameters: {get_hyperparams_hash(self.current_hyperparams)}")
+        elif not self.current_hyperparams or bad_previous_run:  # Reset if not set or previous run was bad
+            # Use default hyperparameters
+            self.current_hyperparams = {
+                'learning_rate': 0.001,
+                'dropout_rate': 0.3,
+                'weight_decay': 0.0001,
+                'optimizer_type': 'adam',
+                'fc_layers': [1024, 512]
+            }
+            if bad_previous_run:
+                logger.info(f"[yellow]⚠️[/yellow] Previous run reached patience limit. Resetting hyperparameters.")
+            logger.info(f"[blue]ℹ[/blue] Reset environment with default hyperparameters: {get_hyperparams_hash(self.current_hyperparams)}")
+        else:
+            logger.info(f"[blue]ℹ[/blue] Keeping existing hyperparameters during reset: {get_hyperparams_hash(self.current_hyperparams)}")
         
-        # Apply default hyperparameters
+        # Apply hyperparameters to the model
         self.cnn_trainer.model.update_hyperparams(self.current_hyperparams)
         self.cnn_trainer.optimizer = self.cnn_trainer.model.get_optimizer()
         
+        # Reset best metrics
+        self.best_val_acc = 0.0
+        self.best_val_loss = float('inf')
+        self.best_hyperparams = copy.deepcopy(self.current_hyperparams)
+        
         # Reset history
-        if options and options.get('keep_history', False):
-            # Just append a marker to separate episodes
-            for key in self.history.keys():
-                if key != 'hyperparams':
-                    self.history[key].append(None)
-        else:
-            # Clear history completely
-            self.history = {
-                'val_acc': [],
-                'val_loss': [],
-                'train_acc': [],
-                'train_loss': [],
-                'hyperparams': [],
-                'rewards': []
-            }
-            
-            # Reset best metrics if not keeping history
-            if not (options and options.get('keep_best', False)):
-                self.best_val_acc = 0.0
-                self.best_val_loss = float('inf')
-                self.best_hyperparams = {}
+        self.history = {
+            'val_acc': [],
+            'val_loss': [],
+            'train_acc': [],
+            'train_loss': [],
+            'hyperparams': [copy.deepcopy(self.current_hyperparams)],
+            'rewards': []
+        }
         
-        # Initial evaluation to get baseline metrics
-        val_metrics = self.cnn_trainer.evaluate()
-        val_loss, val_acc = val_metrics['loss'], val_metrics['accuracy']
-        
-        # Placeholder train metrics until actual training
-        train_loss, train_acc = val_loss, val_acc
-        
-        # Update history with initial values
-        self.history['val_acc'].append(val_acc)
-        self.history['val_loss'].append(val_loss)
-        self.history['train_acc'].append(train_acc)
-        self.history['train_loss'].append(train_loss)
-        self.history['hyperparams'].append(copy.deepcopy(self.current_hyperparams))
-        self.history['rewards'].append(0.0)  # No reward for initial state
-        
-        # Update best metrics if this is truly the first evaluation
-        if len(self.history['val_acc']) == 1 or options and not options.get('keep_best', False):
-            self.best_val_acc = val_acc
-            self.best_val_loss = val_loss
-            self.best_hyperparams = copy.deepcopy(self.current_hyperparams)
+        # Get initial metrics to include in observation
+        try:
+            val_metrics = self.cnn_trainer.evaluate()
+            if val_metrics['loss'] is not None:
+                self.history['val_acc'].append(val_metrics['accuracy'])
+                self.history['val_loss'].append(val_metrics['loss'])
+                
+                # Update best metrics if needed
+                if val_metrics['accuracy'] > self.best_val_acc:
+                    self.best_val_acc = val_metrics['accuracy']
+                    self.best_val_loss = val_metrics['loss']
+        except Exception as e:
+            logger.error(f"Error getting initial metrics: {e}")
+            # Use placeholder values if evaluation fails
+            self.history['val_acc'].append(0.0)
+            self.history['val_loss'].append(1.0)
         
         # Get initial observation
         observation = self._get_observation()
         
+        # Add trend data
+        if len(self.history['val_acc']) >= 2:
+            trend_data = calculate_performance_trends({
+                'history': self.history,
+                'metric_window_size': self.config.get('metric_window_size', 5),
+                'improvement_threshold': self.config.get('improvement_threshold', 0.002),
+                'loss_stagnation_threshold': self.config.get('loss_stagnation_threshold', 0.003)
+            })
+            observation = enhance_observation_with_trends(observation, trend_data)
+            
+        # Info dictionary
         info = {
-            'val_acc': val_acc,
-            'val_loss': val_loss,
-            'train_acc': train_acc,
-            'train_loss': train_loss,
-            'reset_type': 'full' if not (options and options.get('keep_history', False)) else 'episode'
+            'initial_hyperparams': self.current_hyperparams,
+            'initial_val_acc': self.history['val_acc'][0] if self.history['val_acc'] else None,
+            'initial_val_loss': self.history['val_loss'][0] if self.history['val_loss'] else None
         }
         
+        if self.render_mode == 'human':
+            logger.info("[bold blue]Environment reset[/bold blue]")
+            self.render()
+            
         return observation, info
-     
-    def _get_param_hash(self, hyperparams: Dict[str, Any]) -> str:
+
+    def save_agent_brain(self, best=False) -> str:
         """
-        Create a hash string for a hyperparameter configuration to track explored configs.
+        Save the RL agent brain.
         
         Args:
-            hyperparams: Hyperparameter dictionary
+            best: Whether to save as a "best" brain
             
         Returns:
-            str: Hash string representing the configuration
+            str: Path to the saved brain file
         """
-        # Round numerical values to avoid minor differences
-        lr = round(hyperparams.get('learning_rate', 0), 6)
-        wd = round(hyperparams.get('weight_decay', 0), 8)
-        dr = round(hyperparams.get('dropout_rate', 0), 2)
-        fc = '-'.join([str(x) for x in hyperparams.get('fc_layers', [])])
-        opt = hyperparams.get('optimizer_type', '')
+        if not hasattr(self, 'agent') or not hasattr(self.agent, 'save'):
+            logger.warning("[yellow]Warning: Environment has no agent attribute with save method[/yellow]")
+            return None
+            
+        try:
+            timestamp = int(time.time())
+            
+            # Different naming for best brains
+            if best:
+                filename = "hpo_env_best_brain.zip"
+                logger.info(f"[bold green]Saving best RL brain with episode reward: {self.best_episode_reward:.4f}[/bold green]")
+            else:
+                filename = f"hpo_env_brain_step_{self.total_steps}.zip"
+                logger.info(f"[green]Saving periodic RL brain at step {self.total_steps}[/green]")
+            
+            # Full path
+            brain_path = os.path.join(self.brain_save_dir, filename)
+            
+            # Save the brain
+            logger.info(f"[yellow]Saving brain to {brain_path}...[/yellow]")
+            self.agent.save(brain_path)
+            
+            # Save metadata
+            metadata = {
+                "total_steps": self.total_steps,
+                "timestamp": timestamp,
+                "best_val_acc": float(self.best_val_acc),
+                "best_val_loss": float(self.best_val_loss),
+                "current_hyperparams": self.current_hyperparams,
+                "best_hyperparams": self.best_hyperparams,
+                "episode_reward": float(self.history['rewards'][-1]) if self.history['rewards'] else 0.0,
+                "no_improvement_count": self.no_improvement_count,
+                "explored_configs_count": len(self.explored_configs)
+            }
+            
+            # Add best episode reward if it's a best brain save
+            if best:
+                metadata["best_episode_reward"] = float(self.best_episode_reward)
+                
+            # Save metadata to JSON file
+            metadata_path = brain_path.replace(".zip", "_metadata.json")
+            import json
+            with open(metadata_path, 'w') as f:
+                json.dump(metadata, f, indent=2)
+                
+            logger.info(f"[green]✓[/green] Brain saved to {brain_path}")
+            return brain_path
+            
+        except Exception as e:
+            logger.exception("Error saving RL brain")
+            logger.error(f"Error saving RL brain: {str(e)}")
+            return None
+
+    def set_agent(self, agent):
+        """
+        Set the RL agent for this environment.
         
-        return f"lr{lr}_wd{wd}_dr{dr}_fc{fc}_opt{opt}"
-      
-    def render(self):
+        Args:
+            agent: The RL agent to use
         """
-        Render the current state of the environment.
-        """
-        if not self.render_mode:
-            return
-            
-        print("\n" + "="*50)
-        print(f"Step: {self.current_step}/{self.max_steps}")
-        print(f"Current hyperparameters:")
-        for name, value in self.current_hyperparams.items():
-            print(f"  {name}: {value}")
-            
-        if self.history['val_acc']:
-            print(f"\nPerformance:")
-            print(f"  Val Acc: {self.history['val_acc'][-1]:.4f}")
-            print(f"  Val Loss: {self.history['val_loss'][-1]:.4f}")
-            if len(self.history['train_acc']) > 0:
-                print(f"  Train Acc: {self.history['train_acc'][-1]:.4f}")
-                print(f"  Train Loss: {self.history['train_loss'][-1]:.4f}")
-            
-        print(f"\nBest so far:")
-        print(f"  Val Acc: {self.best_val_acc:.4f}")
-        print(f"  Val Loss: {self.best_val_loss:.4f}")
-        
-        if self.history['rewards']:
-            print(f"\nReward: {self.history['rewards'][-1]:.4f}")
-            
-        print(f"Steps without improvement: {self.no_improvement_count}")
-        print("="*50 + "\n")
+        self.agent = agent
+        logger.info("[green]✓[/green] RL agent set in HPO environment")

@@ -1,4 +1,5 @@
 import os
+import time
 import numpy as np
 import logging
 import json
@@ -6,8 +7,26 @@ from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import BaseCallback
 from collections import deque
 from typing import Dict, Any, Optional, List
+from rich.console import Console
+from rich.logging import RichHandler
+from rich.progress import Progress, TextColumn, BarColumn, TimeElapsedColumn, TimeRemainingColumn
+from rich.table import Table
+from rich.panel import Panel
+from io import StringIO
+from ..utils.utils import is_significant_hyperparameter_change
 
-logger = logging.getLogger(__name__)
+# Set up logger using the consistent approach as in main.py
+logger = logging.getLogger("cnn_rl.rl_agent")
+
+# Create a console for rendering tables
+console = Console(highlight=False)  # Disable syntax highlighting to avoid unexpected color codes
+
+# Set up file logger for tables
+file_logger = logging.getLogger("file_logger")
+file_handler = logging.FileHandler("training.log", encoding="utf-8")
+file_handler.setFormatter(logging.Formatter("%(message)s"))  # Plain text format
+file_logger.addHandler(file_handler)
+file_logger.propagate = False  # Prevent double logging
 
 class EvaluationCallback(BaseCallback):
     """
@@ -29,10 +48,51 @@ class EvaluationCallback(BaseCallback):
             # Save best model
             if self.model.ep_info_buffer.mean() > self.best_mean_reward:
                 self.best_mean_reward = self.model.ep_info_buffer.mean()
-                self.model.save("best_model")
-                logger.info(f"Saved new best model with mean reward: {self.best_mean_reward:.2f}")
+                self.model.save("best_rl_brain")
+                logger.info(f"Saved new best RL brain with mean reward: {self.best_mean_reward:.2f}")
                 
         return True
+
+class ProgressCallback(BaseCallback):
+    """
+    Callback to log training progress and enforce maximum timesteps limit.
+    This callback suppresses wandb logging during progress reporting to prevent
+    flickering of the rich progress bar.
+    """
+    def __init__(self, total_steps, interval):
+        super().__init__()
+        self.total_steps = total_steps
+        self.interval = interval
+        self.last_log = 0
+        self.start_timesteps = 0
+        self.original_level = logging.getLogger().level
+
+    def _on_training_start(self):
+        """Initialize progress tracking at the start of training"""
+        # Record the starting timestep count
+        self.start_timesteps = self.model.num_timesteps
+        logger.info(f"Starting training from timestep {self.start_timesteps} for {self.total_steps} steps")
+        
+    def _on_step(self):
+        """Log progress after each step and check for completion"""
+        step = self.num_timesteps
+        relative_step = step - self.start_timesteps
+
+        # Log progress periodically
+        if relative_step % max(1, self.total_steps // 20) == 0 or relative_step >= self.total_steps:
+            progress_pct = min(100, int(100 * relative_step / self.total_steps))
+            logger.info(f"Steps: {relative_step}/{self.total_steps} ({progress_pct}%)")
+
+        # Stop training if we've reached the maximum timesteps
+        if relative_step >= self.total_steps:
+            logger.info(f"Reached maximum training steps ({self.total_steps}). Stopping training.")
+            return False
+
+        return True
+    
+    def _on_training_end(self):
+        """Clean up when training ends"""
+        logger.info("Training completed")
 
 class LRScheduler:
     """Simple learning rate scheduler for PPO agent"""
@@ -89,8 +149,13 @@ class HyperParameterOptimizer:
         os.makedirs(self.brain_save_dir, exist_ok=True)
 
         # Initialize PPO agent (always on CPU for stability regardless of GPU availability)
-        logger.info(f"Initializing PPO agent on CPU")
+        logger.info("[bold blue]Initializing PPO agent[/bold blue]")
         self.lr_scheduler = LRScheduler(self.learning_rate)
+        
+        # Create status message
+        status_message = "[yellow]Creating PPO agent on CPU..."
+        logger.info(status_message)
+        
         self.agent = PPO(
             "MultiInputPolicy",
             env,
@@ -107,6 +172,11 @@ class HyperParameterOptimizer:
             verbose=1,
             device="cpu"  # Always use CPU for RL agent
         )
+        
+        # Connect agent to environment for direct saving
+        if hasattr(self.env, 'set_agent'):
+            self.env.set_agent(self.agent)
+            logger.info("[green]✓[/green] Agent connected to environment for direct saving")
 
         # Store most recent action and state for learning
         self.last_state = None
@@ -114,11 +184,19 @@ class HyperParameterOptimizer:
 
         # Load previously collected episodes if available and configured
         if self.auto_load_episodes:
+            logger.info("[yellow]Loading previous episodes...")
             self._load_episodes()
+            
+            # Train the agent with loaded episodes immediately if we have enough
+            if len(self.collected_episodes) >= self.min_episodes_for_training:
+                logger.info(f"[bold green]Found {len(self.collected_episodes)} previously collected episodes.[/bold green] Training RL agent immediately.")
+                self._train_agent_with_collected_episodes()
+            else:
+                logger.info(f"[yellow]Found {len(self.collected_episodes)} previously collected episodes.[/yellow] Need at least {self.min_episodes_for_training} for training.")
 
-        logger.info("HyperParameterOptimizer initialized on CPU")
+        logger.info("[bold green]✓[/bold green] HyperParameterOptimizer initialized on CPU")
 
-    def optimize_hyperparameters(self, observation: Dict[str, np.ndarray], current_hyperparams: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+    def optimize_hyperparameters(self, observation: Dict[str, np.ndarray], current_hyperparams: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]: 
         """
         Decide whether to intervene based on current model performance.
         If intervention score exceeds threshold, return new hyperparameters.
@@ -134,21 +212,22 @@ class HyperParameterOptimizer:
             # Check for NaN values in observation and replace them
             for key, value in observation.items():
                 if isinstance(value, np.ndarray) and np.isnan(value).any():
-                    logger.warning(f"Found NaN values in observation key '{key}', replacing with zeros")
+                    logger.warning("[yellow]Warning:[/yellow] Found NaN values in observation key '{key}', replacing with zeros")
                     observation[key] = np.nan_to_num(value, nan=0.0)
 
             # Get action from PPO agent (intervention decision + hyperparameter changes)
             try:
+                logger.info("[yellow]Querying RL agent for decision...")
                 action, _states = self.agent.predict(observation)
             except RuntimeError as e:
                 if "nan" in str(e).lower() or "inf" in str(e).lower():
-                    logger.warning(f"Numerical instability in prediction: {e}. Returning no intervention.")
+                    logger.error(f"[red]Numerical instability in prediction: {e}. Returning no intervention.[/red]")
                     return None
                 raise e
             
             # Check for NaN values in the action
             if isinstance(action, np.ndarray) and np.isnan(action).any():
-                logger.warning("Action contains NaN values, returning no intervention")
+                logger.error("[red]Action contains NaN values, returning no intervention[/red]")
                 return None
                 
             # Extract intervention score (first action component)
@@ -156,17 +235,19 @@ class HyperParameterOptimizer:
             
             # Additional check for NaN in intervention score
             if np.isnan(intervention_score):
-                logger.warning("Intervention score is NaN, returning no intervention")
+                logger.error("[red]Intervention score is NaN, returning no intervention[/red]")
                 return None
                 
             # Track recent scores
             self.recent_intervention_scores.append(intervention_score)
             
-            logger.debug(f"Intervention score: {intervention_score:.4f} (threshold: {self.intervention_threshold:.4f})")
+            # Create a colored indicator for intervention score
+            score_color = "green" if intervention_score >= self.intervention_threshold else "yellow"
+            logger.info(f"Intervention score: [{score_color}]{intervention_score:.4f}[/{score_color}] (threshold: {self.intervention_threshold:.4f})")
             
             # If score below threshold, don't intervene
             if intervention_score < self.intervention_threshold:
-                logger.info(f"Intervention score {intervention_score:.4f} below threshold {self.intervention_threshold:.4f}, no intervention")
+                logger.info(f"[yellow]⚠[/yellow] Intervention score below threshold, no intervention needed")
                 return None 
 
             # Convert action to hyperparameters
@@ -176,7 +257,7 @@ class HyperParameterOptimizer:
                 
                 # Check for NaN values in action before conversion
                 if any(np.isnan(x) if isinstance(x, (float, np.float32, np.float64)) else False for x in action):
-                    logger.warning("NaN values in action, returning no intervention")
+                    logger.error("[red]NaN values in action, returning no intervention[/red]")
                     return None
                 
                 hyperparams = self.env.action_to_hp_dict(action)
@@ -184,49 +265,63 @@ class HyperParameterOptimizer:
                 # Verify hyperparams don't contain NaN values
                 for k, v in hyperparams.items():
                     if isinstance(v, (float, np.float32, np.float64)) and np.isnan(v):
-                        logger.warning(f"NaN value in hyperparameter {k}, returning no intervention")
+                        logger.error(f"[red]NaN value in hyperparameter {k}, returning no intervention[/red]")
                         return None
             except Exception as e:
-                logger.error(f"Error converting action to hyperparams: {e}")
+                logger.exception("Error converting action to hyperparameters")
                 return None
 
-            # Check if the new hyperparameters are sufficiently different from current ones
+            # Check for identical hyperparameters (exact equality check)
+            if current_hyperparams is not None and all(
+                hyperparams.get(key) == current_hyperparams.get(key)
+                for key in set(hyperparams.keys()) | set(current_hyperparams.keys())
+            ):
+                logger.warning("[yellow]Proposed hyperparameters are identical to current ones, skipping intervention[/yellow]")
+                return None
+
+            # Display proposed hyperparameters in a table
+            hp_table = Table(title="Proposed Hyperparameters")
+            hp_table.add_column("Parameter", style="cyan")
+            hp_table.add_column("Value", style="green")
+            
+            for param_name, param_value in hyperparams.items():
+                if isinstance(param_value, float):
+                    hp_table.add_row(param_name, f"{param_value:.6f}")
+                else:
+                    hp_table.add_row(param_name, str(param_value))
+            
+            # Display in console
+            console.print(hp_table)
+            
+            # Convert table to plain text for log file
+            buf = StringIO()
+            temp_console = Console(file=buf, force_terminal=False, highlight=False, color_system=None)
+            temp_console.print(hp_table)
+            table_str = buf.getvalue().strip()
+            buf.close()
+            
+            # Log to file
+            file_logger.info("\n" + table_str)
+
+            # Use centralized utility to check if hyperparameter changes are significant
             if current_hyperparams is not None:
-                has_significant_change = False
-                for key, new_value in hyperparams.items():
-                    if key in current_hyperparams:
-                        current_value = current_hyperparams[key]
-                        
-                        # For numeric values, check percentage difference
-                        if isinstance(new_value, (int, float)) and isinstance(current_value, (int, float)):
-                            if current_value != 0:
-                                # If change is less than 5%, consider it not significant
-                                pct_diff = abs(new_value - current_value) / abs(current_value)
-                                if pct_diff > 0.05:  # 5% threshold
-                                    has_significant_change = True
-                                    break
-                            elif new_value != 0:  # Current is 0 but new is not
-                                has_significant_change = True
-                                break
-                        # For non-numeric values, direct comparison
-                        elif new_value != current_value:
-                            has_significant_change = True
-                            break
-                    else:
-                        # New parameter that wasn't in current set
-                        has_significant_change = True
-                        break
-                        
-                if not has_significant_change:
-                    logger.info("Proposed hyperparameters too similar to current ones, skipping intervention")
+                is_significant, is_major, reason = is_significant_hyperparameter_change(
+                    hyperparams, current_hyperparams
+                )
+                
+                if not is_significant:
+                    logger.warning("[yellow]Proposed hyperparameters too similar to current ones, skipping intervention[/yellow]")
                     return None
-                    
-                logger.info("Significant hyperparameter changes detected, proceeding with intervention")
+                
+                if is_major:
+                    logger.info(f"[bold red]Major hyperparameter change detected:[/bold red] {reason}")
+                else:
+                    logger.info(f"[bold green]Significant hyperparameter changes detected, proceeding with intervention[/bold green]")
     
             return hyperparams
 
         except Exception as e:
-            logger.error(f"Error during hyperparameter optimization: {str(e)}")
+            logger.exception("Error during hyperparameter optimization")
             return None
 
     def learn_from_episode(self, episode_experiences: List[Dict]) -> bool:
@@ -241,13 +336,13 @@ class HyperParameterOptimizer:
         """
         try:
             if not episode_experiences:
-                logger.warning("Empty episode experiences, skipping collection")
+                logger.warning("[yellow]Warning:[/yellow] Empty episode experiences, skipping collection")
                 return False
                 
             # Store this episode's experiences
             self.collected_episodes.append(episode_experiences)
-            logger.info(f"Collected episode with {len(episode_experiences)} experiences. " + 
-                       f"Total episodes: {len(self.collected_episodes)}/{self.min_episodes_for_training}")
+            logger.info(f"Collected episode with [cyan]{len(episode_experiences)}[/cyan] experiences. " + 
+                         f"Total episodes: [cyan]{len(self.collected_episodes)}/{self.min_episodes_for_training}[/cyan]")
             
             # Keep memory limited
             if len(self.collected_episodes) > self.max_episodes_memory:
@@ -265,9 +360,9 @@ class HyperParameterOptimizer:
             return self._train_agent_with_collected_episodes()
 
         except Exception as e:
-            logger.error(f"Error during RL agent episode collection: {str(e)}")
+            logger.exception(f"Error during RL agent episode collection: {str(e)}")
             return False
-            
+        
     def _train_agent_with_collected_episodes(self) -> bool:
         """
         Train the agent using all collected episodes with SARST format.
@@ -276,7 +371,7 @@ class HyperParameterOptimizer:
             bool: True if training was successful, False otherwise
         """
         if not self.collected_episodes:
-            logger.warning("No episodes to train on")
+            logger.warning("[yellow]Warning:[/yellow] No episodes to train on")
             return False
             
         # Extract all experiences from collected episodes
@@ -291,66 +386,68 @@ class HyperParameterOptimizer:
             all_rewards.extend(ep_rewards)
                 
         if not all_rewards:
-            logger.warning("No rewards found in collected episodes")
+            logger.warning("[yellow]Warning:[/yellow] No rewards found in collected episodes")
             return False
             
-        # Log training statistics
+        # Calculate training statistics
         mean_reward = np.mean(all_rewards)
         std_reward = np.std(all_rewards)
+        min_reward = min(all_rewards)
+        max_reward = max(all_rewards)
         
-        logger.info(f"Training PPO agent with {experience_count} experiences from {len(self.collected_episodes)} episodes")
-        logger.info(f"Reward statistics: mean={mean_reward:.4f}, std={std_reward:.4f}, min={min(all_rewards):.4f}, max={max(all_rewards):.4f}")
+        # Create summary table
+        stats_table = Table(title="Training Statistics")
+        stats_table.add_column("Metric", style="cyan")
+        stats_table.add_column("Value", style="green")
+        stats_table.add_row("Experiences", str(experience_count))
+        stats_table.add_row("Episodes", str(len(self.collected_episodes)))
+        stats_table.add_row("Mean reward", f"{mean_reward:.4f}")
+        stats_table.add_row("Std dev", f"{std_reward:.4f}")
+        stats_table.add_row("Min reward", f"{min_reward:.4f}")
+        stats_table.add_row("Max reward", f"{max_reward:.4f}")
+        
+        # Display in console
+        console.print(stats_table)
+        
+        # Convert table to plain text for log file
+        buf = StringIO()
+        temp_console = Console(file=buf, force_terminal=False, highlight=False, color_system=None)
+        temp_console.print(stats_table)
+        table_str = buf.getvalue().strip()
+        buf.close()
+        
+        # Log to file
+        file_logger.info("\n" + table_str)
+        
+        logger.info("[bold blue]Starting PPO Training")
         
         # Create a progress bar for training
         total_steps = self.training_timesteps
-        progress_interval = max(1, total_steps // 20)  # Report progress ~20 times
-        logger.info(f"Starting training for {total_steps} timesteps...")
+        progress_interval = max(1, total_steps // 40)  # Report progress ~40 times
+        logger.info(f"Training for [cyan]{total_steps}[/cyan] timesteps...")
         
-        # Custom callback to log progress and enforce max steps
-        class ProgressCallback(BaseCallback):
-            def __init__(self, total_steps, interval):
-                super().__init__()
-                self.total_steps = total_steps
-                self.interval = interval
-                self.last_log = 0
-                self.start_timesteps = 0
-                
-            def _on_training_start(self):
-                # Record the starting timestep count
-                self.start_timesteps = self.model.num_timesteps
-                
-            def _on_step(self):
-                step = self.num_timesteps
-                relative_step = step - self.start_timesteps
-                
-                # Log progress at specified intervals
-                if step - self.last_log >= self.interval:
-                    progress_pct = min(100, int(100 * relative_step / self.total_steps))
-                    logger.info(f"Training progress: {relative_step}/{self.total_steps} steps ({progress_pct}%)")
-                    self.last_log = step
-                
-                # Stop training if we've reached the maximum timesteps
-                if relative_step >= self.total_steps:
-                    logger.info(f"Reached maximum training steps ({self.total_steps}). Stopping training.")
-                    return False
-                    
-                return True
-                
+        # Create a callback for training progress
         progress_callback = ProgressCallback(total_steps, progress_interval)
         
-        # Train the agent
+        # Ensure any existing live displays are cleared
+        if hasattr(console, '_live') and console._live is not None:
+            console.clear_live()
+        
+        # Train the agent - don't use console.status here as it creates a live display
+        # that would conflict with the progress callback's own live display
         try:
             self.agent.learn(
                 total_timesteps=self.training_timesteps, 
                 reset_num_timesteps=False,
                 callback=progress_callback
             )
-            logger.info(f"Training completed. Average reward: {mean_reward:.4f}")
+            logger.info(f"[green]✓[/green] Training completed. Average reward: [cyan]{mean_reward:.4f}[/cyan]")
         except Exception as e:
             if "Training ended" in str(e):
-                logger.info("Training ended by callback")
+                logger.warning("[yellow]Training ended by callback[/yellow]")
             else:
-                logger.error(f"Error during training: {str(e)}")
+                logger.exception("Error during training")
+                logger.error(f"[red]Error during training: {str(e)}[/red]")
                 return False
         
         # Update dynamic parameters based on mean performance
@@ -358,7 +455,38 @@ class HyperParameterOptimizer:
         
         # Save episodes for future use before resetting
         if self.auto_save_episodes:
+            logger.info("[yellow]Saving episodes...")
             self._save_episodes()
+        
+        # Save the brain after training with timestamp
+        timestamp = int(time.time())
+        brain_path = os.path.join(self.brain_save_dir, f"rl_brain_training_{timestamp}.zip")
+        logger.info(f"[yellow]Saving RL brain to {brain_path}...")
+        self.save_brain(brain_path)
+        
+        # If this is the best reward we've seen, also save as best_rl_brain
+        if not hasattr(self, 'best_reward') or mean_reward > self.best_reward:
+            self.best_reward = mean_reward
+            best_brain_path = os.path.join(self.brain_save_dir, "best_rl_brain.zip")
+            
+            logger.info("[bold green]Saving best brain...")
+            # Create metadata file with reward info
+            metadata = {
+                "best_reward": mean_reward,
+                "training_step": self.training_step,
+                "intervention_threshold": self.intervention_threshold
+            }
+            
+            # Save metadata to a separate file
+            metadata_path = os.path.join(self.brain_save_dir, "best_rl_brain_metadata.json")
+            with open(metadata_path, 'w') as f:
+                json.dump(metadata, f, indent=2)
+            
+            # Copy the current brain to best_brain location
+            import shutil
+            shutil.copy(brain_path, best_brain_path)
+            
+            logger.info(f"[bold green]✓[/bold green] New best RL brain saved with reward: [cyan]{mean_reward:.4f}[/cyan]")
         
         # Reset collection after training
         self.collected_episodes = []
@@ -394,8 +522,8 @@ class HyperParameterOptimizer:
         self.training_timesteps = int(self.training_timesteps_min + 
                                      progress * (self.training_timesteps_max - self.training_timesteps_min))
         
-        logger.debug(f"Updated parameters - Intervention threshold: {self.intervention_threshold:.2f}, " +
-                    f"Training timesteps: {self.training_timesteps}")
+        logger.info(f"[dim]Updated parameters - Intervention threshold: [cyan]{self.intervention_threshold:.2f}[/cyan], " +
+                    f"Training timesteps: [cyan]{self.training_timesteps}[/cyan][/dim]")
 
     def update_cnn_epoch(self, epoch: int) -> None:
         """
@@ -445,10 +573,10 @@ class HyperParameterOptimizer:
             with open(metadata_path, 'w') as f:
                 json.dump(metadata, f, indent=2)
                 
-            logger.info(f"Saved RL agent to {filepath} with metadata")
+            logger.info(f"[green]✓[/green] Saved RL agent brain to {filepath}")
             return filepath
         except Exception as e:
-            logger.error(f"Error saving RL agent: {str(e)}")
+            logger.exception(f"Error saving RL agent brain: {str(e)}")
             return None
 
     def load_brain(self, filepath: str) -> bool:
@@ -463,9 +591,10 @@ class HyperParameterOptimizer:
         """
         try:
             if not os.path.exists(filepath):
-                logger.error(f"Brain file not found: {filepath}")
+                logger.error(f"[red]RL brain file not found: {filepath}[/red]")
                 return False
                 
+            logger.info(f"[yellow]Loading RL brain from {filepath}...")
             self.agent = PPO.load(filepath, env=self.env, device="cpu")
             
             # Try to load metadata if available
@@ -479,36 +608,164 @@ class HyperParameterOptimizer:
                 self.training_step = metadata.get('training_step', self.training_step)
                 self.intervention_threshold = metadata.get('intervention_threshold', self.intervention_threshold)
                 
-            logger.info(f"Loaded RL agent from {filepath}")
+            logger.info(f"[green]✓[/green] Loaded RL agent brain from {filepath}")
             return True
         except Exception as e:
-            logger.error(f"Error loading RL agent: {str(e)}")
+            logger.exception(f"Error loading RL agent brain: {str(e)}")
             return False
 
     def _load_episodes(self) -> None:
         """
         Load previously collected episodes from a file.
+        Uses the structured versioned format.
         """
         try:
             if not os.path.exists(self.episodes_save_path):
-                logger.info(f"No previous episodes found at {self.episodes_save_path}. Starting with empty episodes collection.")
+                logger.warning(f"[yellow]No previous episodes found at {self.episodes_save_path}. Starting with empty episodes collection.[/yellow]")
                 return
                 
             with open(self.episodes_save_path, 'r') as f:
-                self.collected_episodes = json.load(f)
+                loaded_data = json.load(f)
                 
-            logger.info(f"Loaded {len(self.collected_episodes)} episodes from {self.episodes_save_path}")
+            # Check if this is a valid versioned format
+            if not isinstance(loaded_data, dict) or "version" not in loaded_data or "episodes" not in loaded_data:
+                logger.warning(f"[yellow]Warning:[/yellow] Episodes file {self.episodes_save_path} has invalid format. Starting with empty episodes.")
+                self.collected_episodes = []
+                return
+                
+            # Extract episodes and metadata
+            self.collected_episodes = loaded_data["episodes"]
+            
+            # Restore relevant metadata if available
+            if "metadata" in loaded_data:
+                metadata = loaded_data["metadata"]
+                self.intervention_threshold = metadata.get("intervention_threshold", self.intervention_threshold)
+                self.training_timesteps = metadata.get("training_timesteps", self.training_timesteps)
+                
+            logger.info(f"Loaded [cyan]{len(self.collected_episodes)}[/cyan] episodes from {self.episodes_save_path} (format version {loaded_data.get('version', 1)})")
+            
+            # Enforce memory limit
+            if len(self.collected_episodes) > self.max_episodes_memory:
+                logger.info(f"[yellow]Limiting loaded episodes[/yellow] to the most recent {self.max_episodes_memory} (from {len(self.collected_episodes)} total)")
+                self.collected_episodes = self.collected_episodes[-self.max_episodes_memory:]
+                
         except Exception as e:
-            logger.error(f"Error loading episodes: {str(e)}")
+            logger.exception(f"Error loading episodes: {str(e)}")
+            # Start with empty episodes on error
+            self.collected_episodes = []
 
     def _save_episodes(self) -> None:
         """
-        Save collected episodes to a file.
+        Save collected RL training episodes to a file.
+        Uses a versioned approach to maintain multiple sets of episodes.
         """
         try:
-            with open(self.episodes_save_path, 'w') as f:
-                json.dump(self.collected_episodes, f, indent=2)
+            # Convert numpy arrays to lists for JSON serialization
+            serializable_episodes = []
+            
+            for episode in self.collected_episodes:
+                serializable_experiences = []
                 
-            logger.info(f"Saved {len(self.collected_episodes)} episodes to {self.episodes_save_path}")
+                for exp in episode:
+                    # Create a copy of the experience that we can modify
+                    serializable_exp = {}
+                    
+                    # Convert each field in the experience
+                    for key, value in exp.items():
+                        # Convert numpy arrays to lists
+                        if isinstance(value, np.ndarray):
+                            serializable_exp[key] = value.tolist()
+                        # Handle nested dictionaries (like state and next_state)
+                        elif isinstance(value, dict):
+                            serializable_exp[key] = {}
+                            for k, v in value.items():
+                                if isinstance(v, np.ndarray):
+                                    serializable_exp[key][k] = v.tolist()
+                                else:
+                                    serializable_exp[key][k] = v
+                        # Keep other types as is
+                        else:
+                            serializable_exp[key] = value
+                            
+                    serializable_experiences.append(serializable_exp)
+                
+                serializable_episodes.append(serializable_experiences)
+            
+            # Create a structured episodes file that supports versioning and metadata
+            episodes_data = {
+                "version": 1,
+                "timestamp": time.time(),
+                "training_step": self.training_step,
+                "episode_count": len(serializable_episodes),
+                "metadata": {
+                    "intervention_threshold": self.intervention_threshold,
+                    "training_timesteps": self.training_timesteps
+                },
+                "episodes": serializable_episodes
+            }
+            
+            # Create episodes directory if it doesn't exist
+            episodes_dir = os.path.dirname(self.episodes_save_path)
+            os.makedirs(episodes_dir, exist_ok=True)
+            
+            # Save the current episodes to the standard path for loading next time
+            with open(self.episodes_save_path, 'w') as f:
+                json.dump(episodes_data, f, indent=2)
+            
+            # Also save a timestamped version to maintain history
+            # Only keep a fixed number of history files
+            self._maintain_episode_history(episodes_data)
+                
+            logger.info(f"Saved {len(self.collected_episodes)} RL training episodes to {self.episodes_save_path}")
         except Exception as e:
-            logger.error(f"Error saving episodes: {str(e)}")
+            logger.error(f"[red]Error saving RL training episodes: {str(e)}[/red]")
+            
+    def _maintain_episode_history(self, episodes_data):
+        """
+        Maintain a history of episode files by saving timestamped versions
+        and cleaning up old files when there are too many.
+        
+        Args:
+            episodes_data: The episode data to save
+        """
+        try:
+            # Define max number of history files to keep
+            max_history_files = 10
+            
+            # Create a timestamped filename
+            timestamp = int(time.time())
+            base_dir = os.path.dirname(self.episodes_save_path)
+            base_filename = os.path.basename(self.episodes_save_path)
+            history_dir = os.path.join(base_dir, "episodes_history")
+            os.makedirs(history_dir, exist_ok=True)
+            
+            # Name format: original_name_timestamp.json
+            history_filename = os.path.splitext(base_filename)[0] + f"_{timestamp}.json"
+            history_path = os.path.join(history_dir, history_filename)
+            
+            # Save the timestamped version
+            with open(history_path, 'w') as f:
+                json.dump(episodes_data, f, indent=2)
+                
+            # List all history files
+            history_files = []
+            for f in os.listdir(history_dir):
+                if f.endswith('.json') and f.startswith(os.path.splitext(base_filename)[0]):
+                    file_path = os.path.join(history_dir, f)
+                    history_files.append((os.path.getmtime(file_path), file_path))
+            
+            # Sort by modification time (oldest first)
+            history_files.sort()
+            
+            # Remove oldest files if we have too many
+            if len(history_files) > max_history_files:
+                for _, old_file in history_files[:(len(history_files) - max_history_files)]:
+                    try:
+                        os.remove(old_file)
+                        logger.info(f"[dim]Removed old episodes history file: {old_file}[/dim]")
+                    except Exception as e:
+                        logger.warning(f"[yellow]Could not remove old episodes file {old_file}: {e}[/yellow]")
+                        
+        except Exception as e:
+            logger.warning(f"[yellow]Error maintaining episode history: {e}[/yellow]")
+            # Continue execution - this is not critical

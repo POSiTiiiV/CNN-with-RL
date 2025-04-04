@@ -10,8 +10,8 @@ training:
   batch_size: 64  # Increased from 32 to better utilize GPU memory
   learning_rate: 0.001
   epochs: 30
-  max_epochs: 200
-  early_stopping_patience: 100 # TODO: remember to change it back to maybe 30
+  max_epochs: 100
+  early_stopping_patience: 70 # TODO: remember to change it back to maybe 30
   checkpoint_frequency: 5
   min_epochs_before_intervention: 5
   intervention_frequency: 5

@@ -1,6 +1,5 @@
 import os
 import argparse
-import logging
 import yaml
 import time
 import json
@@ -9,6 +8,8 @@ import random
 import numpy as np
 import torch
 import wandb
+from rich.logging import RichHandler
+import logging
 
 # Import project modules
 from src.models.cnn import PretrainedCNN
@@ -18,16 +19,20 @@ from src.trainers.trainer import ModelTrainer
 from src.envs.hpo_env import HPOEnvironment
 from src.data_loaders.data_loader import load_dataset  # Import the new data loader module
 
-# Configure logging
+# Create separate handlers for console (RichHandler) and file logging (plain text)
+file_handler = logging.FileHandler("training.log", encoding="utf-8")
+file_handler.setFormatter(logging.Formatter("%(message)s"))  # Plain text format
+
+console_handler = RichHandler(show_time=False, rich_tracebacks=True, markup=True)
+
+# Configure logging with both handlers
 logging.basicConfig(
-    level=logging.DEBUG,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler('training.log')
-    ]
+    level=logging.INFO,
+    format="%(message)s",
+    handlers=[console_handler, file_handler],  # Console (rich) & File (plain)
 )
-logger = logging.getLogger(__name__)
+
+logger = logging.getLogger("cnn_rl")
 
 def parse_args():
     """Parse command line arguments"""
@@ -95,10 +100,10 @@ def load_config(config_path):
     try:
         with open(config_path, "r") as f:
             config = yaml.safe_load(f)
-        logger.info(f"Loaded configuration from {config_path}")
+        logger.info(f"[green]Loaded configuration from {config_path}[/green]")
         return config
     except Exception as e:
-        logger.error(f"Failed to load configuration from {config_path}: {e}")
+        logger.error(f"[bold red]Failed to load configuration from {config_path}: {e}[/bold red]")
         raise
 
 def set_seed(seed):
@@ -112,7 +117,7 @@ def set_seed(seed):
         # Set deterministic behavior
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
-    logger.info(f"Set random seed to {seed}")
+    logger.debug(f"[dim]Set random seed to {seed}[/dim]")
 
 def get_device(args_device=None):
     """Get device for PyTorch"""
@@ -121,14 +126,14 @@ def get_device(args_device=None):
     else:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    logger.info(f"Using device: {device}")
+    logger.info(f"[cyan]Using device: {device}[/cyan]")
     if device.type == 'cuda':
-        logger.info(f"GPU: {torch.cuda.get_device_name(device)}")
-        logger.info(f"GPU Memory: {torch.cuda.get_device_properties(device).total_memory / 1e9:.2f} GB")
+        logger.info(f"[cyan]GPU: {torch.cuda.get_device_name(device)}[/cyan]")
+        logger.info(f"[cyan]GPU Memory: {torch.cuda.get_device_properties(device).total_memory / 1e9:.2f} GB[/cyan]")
         # Enable performance optimizations for GPU
         torch.backends.cudnn.benchmark = True  # Enable for consistent input sizes
         torch.backends.cudnn.deterministic = False  # Allow non-deterministic algorithms for better performance
-        logger.info(f"CUDA optimizations enabled")
+        logger.info(f"[green]CUDA optimizations enabled[/green]")
     
     return device
 
@@ -141,16 +146,16 @@ def create_model(config, device):
     model = PretrainedCNN(config["model"])
     model.to(device)
     
-    logger.info(f"Created model: {type(model).__name__}")
-    logger.info(f"Model config: {config['model']}")
-    logger.info(f"Model device: {next(model.parameters()).device}")
+    logger.info(f"[green]Created model: {type(model).__name__}[/green]")
+    logger.debug(f"[dim]Model config: {config['model']}[/dim]")
+    logger.debug(f"[dim]Model device: {next(model.parameters()).device}[/dim]")
     
     return model
 
 def init_wandb(args, config):
     """Initialize Weights & Biases for experiment tracking"""
     if not args.wandb:
-        logger.info("Weights & Biases logging disabled")
+        logger.warning("[yellow]Weights & Biases logging disabled[/yellow]")
         return False
     
     try:
@@ -161,7 +166,7 @@ def init_wandb(args, config):
         
         # Check if wandb is already initialized
         if wandb.run is not None:
-            logger.info("WandB already initialized, using existing run")
+            logger.info("[blue]WandB already initialized, using existing run[/blue]")
             return True
             
         # Initialize wandb
@@ -174,13 +179,13 @@ def init_wandb(args, config):
         
         # Double check that initialization worked
         if wandb.run is None:
-            logger.warning("WandB initialization failed to create a run")
+            logger.warning("[bold yellow]WandB initialization failed to create a run[/bold yellow]")
             return False
             
-        logger.info(f"Initialized Weights & Biases: project='{project_name}', run='{run_name}'")
+        logger.info(f"[blue]Initialized Weights & Biases: project='{project_name}', run='{run_name}'[/blue]")
         return True
     except Exception as e:
-        logger.warning(f"Failed to initialize Weights & Biases: {e}")
+        logger.warning(f"[bold yellow]Failed to initialize Weights & Biases: {e}[/bold yellow]")
         return False
 
 def save_config(config, output_dir):
@@ -189,7 +194,7 @@ def save_config(config, output_dir):
     config_path = os.path.join(output_dir, "config.yaml")
     with open(config_path, "w") as f:
         yaml.dump(config, f, default_flow_style=False)
-    logger.info(f"Saved configuration to {config_path}")
+    logger.info(f"[green]Saved configuration to {config_path}[/green]")
 
 def main():
     """Main function"""
@@ -239,13 +244,21 @@ def main():
     wandb_initialized = init_wandb(args, config)
     
     try:
+        logger.info("[bold blue]Loading Data and Model[/bold blue]")
+        
         # Load dataset
+        logger.info("[bold green]Loading datasets...[/bold green]")
         train_loader, val_loader, test_loader = load_dataset(
             config, args.data_dir
         )
+        logger.info(f"[green]✓[/green] Datasets loaded successfully")
         
         # Create model
+        logger.info("[bold green]Creating model...[/bold green]")
         model = create_model(config, device)
+        logger.info(f"[green]✓[/green] Model created: {type(model).__name__}")
+        
+        logger.info("[bold blue]Setting up Training Environment[/bold blue]")
         
         # Create CNN trainer
         cnn_trainer = CNNTrainer(
@@ -271,11 +284,11 @@ def main():
         # Load pre-trained RL brain if specified
         if args.rl_brain:
             brain_path = args.rl_brain
-            logger.info(f"Loading pre-trained RL brain from {brain_path}")
+            logger.info(f"[bold yellow]Loading RL brain from {brain_path}...[/bold yellow]")
             if rl_optimizer.load_brain(brain_path):
-                logger.info("Successfully loaded RL brain")
+                logger.info(f"[green]✓[/green] Successfully loaded RL brain")
             else:
-                logger.warning(f"Failed to load RL brain, using new agent")
+                logger.error(f"[red]✗[/red] Failed to load RL brain, using new agent")
         
         # Create model trainer
         trainer = ModelTrainer(
@@ -286,20 +299,23 @@ def main():
         
         # Resume from checkpoint if specified
         if args.resume:
-            logger.info(f"Resuming training from checkpoint: {args.resume}")
+            logger.info(f"[bold yellow]Resuming from checkpoint: {args.resume}...[/bold yellow]")
             trainer.load_checkpoint(args.resume)
+            logger.info(f"[green]✓[/green] Checkpoint loaded")
         
         # Train model with RL-based hyperparameter optimization
-        logger.info("Starting training with RL-based hyperparameter optimization...")
+        logger.info("[bold blue]Starting Training[/bold blue]")
+        logger.info("[bold green]Training model with RL-based hyperparameter optimization...[/bold green]")
         start_time = time.time()
         
         history = trainer.train(epochs=args.epochs)
         
         training_time = time.time() - start_time
-        logger.info(f"Training completed in {training_time:.2f} seconds")
+        logger.info(f"[bold green]Training completed in {training_time:.2f} seconds[/bold green]")
         
         # Evaluate on test set
-        logger.info("Evaluating on test set...")
+        logger.info("[bold blue]Evaluation[/bold blue]")
+        logger.info("[bold yellow]Evaluating on test set...[/bold yellow]")
         test_metrics = cnn_trainer.evaluate(test_loader)
         test_loss = test_metrics.get('loss', 0)
         test_acc = test_metrics.get('accuracy', 0)
@@ -308,11 +324,10 @@ def main():
         try:
             test_acc = float(test_acc) if isinstance(test_acc, str) else test_acc
             test_loss = float(test_loss) if isinstance(test_loss, str) else test_loss
-            logger.info(f"Test accuracy: {test_acc:.4f}, Test loss: {test_loss:.4f}")
+            logger.info(f"[bold green]Test results: [/bold green][cyan]Accuracy: {test_acc:.4f}, Loss: {test_loss:.4f}[/cyan]")
         except (ValueError, TypeError):
-            # If conversion fails, log without formatting
-            logger.info(f"Test accuracy: {test_acc}, Test loss: {test_loss}")
-            logger.warning("Could not format test metrics as floats. Check data types.")
+            logger.warning(f"[bold yellow]Test results: [/bold yellow][cyan]Accuracy: {test_acc}, Loss: {test_loss}[/cyan]")
+            logger.warning("[yellow]Warning: Could not format test metrics as floats. Check data types.[/yellow]")
         
         # Save results
         results_file = os.path.join(run_dir, "results.json")
@@ -328,12 +343,12 @@ def main():
                 "rl_interventions_count": len(trainer.history["rl_interventions"]),
             }, f, indent=2)
         
-        logger.info(f"Results saved to {results_file}")
+        logger.info(f"[green]✓[/green] Results saved to {results_file}")
         
         # Save final RL brain
         final_brain_path = os.path.join(run_dir, "final_rl_brain.zip")
         rl_optimizer.save_brain(final_brain_path)
-        logger.info(f"Final RL brain saved to {final_brain_path}")
+        logger.info(f"[green]✓[/green] Final RL brain saved to {final_brain_path}")
         
         # Finalize wandb
         if wandb_initialized and wandb.run is not None:
@@ -358,12 +373,14 @@ def main():
                     )
                     model_artifact.add_file(best_model_path)
                     wandb.log_artifact(model_artifact)
+                    logger.info(f"[green]✓[/green] Model artifact uploaded to W&B")
                 else:
-                    logger.warning(f"Best model file not found: {best_model_path}")
+                    logger.error(f"[red]✗[/red] Best model file not found: {best_model_path}")
                 
                 wandb.finish()
+                logger.info("[green]✓[/green] W&B logging completed")
             except Exception as wandb_error:
-                logger.warning(f"Error during WandB logging: {wandb_error}")
+                logger.error(f"[red]✗[/red] Error during W&B logging: {str(wandb_error)}")
                 # Try to finish the run even if there was an error
                 try:
                     if wandb.run is not None:
@@ -371,10 +388,11 @@ def main():
                 except:
                     pass
         
-        logger.info("Training completed successfully!")
+        logger.info("[bold green]Training Complete![/bold green]")
         
     except Exception as e:
-        logger.exception(f"Error during training: {e}")
+        logger.exception("An error occurred during training")
+        logger.error(f"[bold red]Error during training: {str(e)}[/bold red]")
         if wandb_initialized and wandb.run is not None:
             # Log error and finish wandb run
             try:
@@ -386,4 +404,3 @@ def main():
 
 if __name__ == "__main__":
     main()
- # while($true) { nvidia-smi; Start-Sleep -Seconds 2; Clear-Host }

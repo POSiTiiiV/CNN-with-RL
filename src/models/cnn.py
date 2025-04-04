@@ -3,7 +3,15 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torchvision.models import resnet34, ResNet34_Weights
+from torch.cuda.amp import GradScaler, autocast
 from collections import OrderedDict
+from rich.console import Console
+import logging
+from ..utils.utils import get_optimizer
+
+# Configure Rich console
+console = Console()
+logger = logging.getLogger("cnn_rl.models.cnn")
 
 class PretrainedCNN(nn.Module):
     def __init__(self, config):
@@ -77,23 +85,22 @@ class PretrainedCNN(nn.Module):
         Args:
             hyperparams: Dictionary containing hyperparameters to update
         """
-        # Log current hyperparameters before update
-        import logging
-        logger = logging.getLogger(__name__)
-        logger.info("Current hyperparameters before RL agent intervention:")
-        for param_name, param_value in self.hyperparams.items():
-            logger.info(f"  {param_name}: {param_value}")
-        
+        # Check if anything would actually change
+        has_changes = False
+        for param, value in hyperparams.items():
+            if param in self.hyperparams and self.hyperparams[param] != value:
+                has_changes = True
+                break
+                
+        if not has_changes:
+            logger.debug("No hyperparameter changes needed, skipping update")
+            return
+            
         # Update stored hyperparameter values
         for param, value in hyperparams.items():
             if param in self.hyperparams:
                 self.hyperparams[param] = value
-        
-        # Log updated hyperparameters
-        logger.info("Updated hyperparameters after RL agent intervention:")
-        for param_name, param_value in self.hyperparams.items():
-            logger.info(f"  {param_name}: {param_value}")
-            
+
         # Handle dropout rate changes
         if 'dropout_rate' in hyperparams:
             new_rate = hyperparams['dropout_rate']
@@ -145,41 +152,12 @@ class PretrainedCNN(nn.Module):
         Returns:
             torch.optim.Optimizer: Configured optimizer
         """
-        # Determine which parameters to optimize
-        if self.freeze_backbone:
-            params = self.head.parameters()
-        else:
-            params = self.parameters()
-        
-        # Create optimizer based on type
-        if self.hyperparams['optimizer_type'].lower() == 'adam':
-            optimizer = optim.Adam(
-                params,
-                lr=self.hyperparams['learning_rate'],
-                weight_decay=self.hyperparams['weight_decay']
-            )
-        elif self.hyperparams['optimizer_type'].lower() == 'sgd':
-            optimizer = optim.SGD(
-                params,
-                lr=self.hyperparams['learning_rate'],
-                momentum=0.9,
-                weight_decay=self.hyperparams['weight_decay']
-            )
-        elif self.hyperparams['optimizer_type'].lower() == 'adamw':
-            optimizer = optim.AdamW(
-                params,
-                lr=self.hyperparams['learning_rate'],
-                weight_decay=self.hyperparams['weight_decay']
-            )
-        else:
-            # Default to Adam
-            optimizer = optim.Adam(
-                params,
-                lr=self.hyperparams['learning_rate'],
-                weight_decay=self.hyperparams['weight_decay']
-            )
-            
-        return optimizer
+        return get_optimizer(
+            self,
+            optimizer_type=self.hyperparams['optimizer_type'],
+            learning_rate=self.hyperparams['learning_rate'],
+            weight_decay=self.hyperparams['weight_decay']
+        )
         
     def configure_for_mixed_precision(self):
         """
@@ -188,10 +166,9 @@ class PretrainedCNN(nn.Module):
         Returns:
             Tuple containing model and optimizer for mixed precision training
         """
-        from torch.cuda.amp import GradScaler, autocast
         
-        # Create gradient scaler for mixed precision training
-        scaler = GradScaler()
+        # Create gradient scaler for mixed precision training using the updated API
+        scaler = GradScaler("cuda")
         
         # Get optimizer
         optimizer = self.get_optimizer()
