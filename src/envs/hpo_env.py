@@ -16,6 +16,7 @@ from ..utils.utils import (
     calculate_performance_trends, 
     get_hyperparams_hash
 )
+from ..utils.rl_scheduler import RLStepScheduler  # Import the new dynamic scheduler
 
 # Create a logger for rendering tables
 logger = logging.getLogger(__name__)
@@ -29,7 +30,7 @@ class HPOEnvironment(gym.Env):
     """
     metadata = {'render_modes': ['human']}
     
-    def __init__(self, cnn_trainer, config, render_mode=None):
+    def __init__(self, cnn_trainer, config, render_mode="humman"):
         super(HPOEnvironment, self).__init__()
         
         self.cnn_trainer = cnn_trainer
@@ -38,13 +39,44 @@ class HPOEnvironment(gym.Env):
         
         # Extract configuration
         self.max_steps = config.get('max_steps_per_episode', 10)
-        self.epochs_per_step = config.get('epochs_per_step', 1)
+        self.epochs_per_step = config.get('epochs_per_step', 3)  # Default increased from 1 to 3
         self.reward_scaling = config.get('reward_scaling', 10.0)
         self.exploration_bonus = config.get('exploration_bonus', 0.5)
         self.patience = self.config.get('patience', 6)  # Default to 10 steps
-        self.intervention_frequency = config.get('intervention_frequency', 5)
         self.stagnation_epochs = 3
         self.stagnation_threshold = self.config.get('stagnation_threshold', 0.01)  # Default to 0.01
+        
+        # Initialize the dynamic RL step scheduler with epochs_per_step parameters
+        initial_training_timesteps = self.config.get('initial_training_timesteps', 1000)
+        min_training_timesteps = self.config.get('min_training_timesteps', 500)
+        max_training_timesteps = self.config.get('max_training_timesteps', 5000)
+        initial_epochs_per_step = self.config.get('initial_epochs_per_step', self.epochs_per_step)
+        min_epochs_per_step = self.config.get('min_epochs_per_step', 2)
+        max_epochs_per_step = self.config.get('max_epochs_per_step', 7)
+        stagnation_patience = self.config.get('stagnation_patience', 2)
+        
+        self.use_dynamic_steps = self.config.get('use_dynamic_steps', True)
+        self.rl_step_scheduler = RLStepScheduler(
+            initial_training_timesteps=initial_training_timesteps,
+            min_training_timesteps=min_training_timesteps,
+            max_training_timesteps=max_training_timesteps,
+            initial_epochs_per_step=initial_epochs_per_step,
+            min_epochs_per_step=min_epochs_per_step,
+            max_epochs_per_step=max_epochs_per_step,
+            stagnation_patience=stagnation_patience
+        )
+        
+        # Use the initial scheduler values
+        if self.use_dynamic_steps:
+            # Get initial values from scheduler
+            self.training_timesteps, self.epochs_per_step = self.rl_step_scheduler.get_current_params()
+            logger.info(f"Using dynamic RL step scheduling:")
+            logger.info(f"  - Training timesteps: initial={initial_training_timesteps}, min={min_training_timesteps}, max={max_training_timesteps}")
+            logger.info(f"  - Epochs per step: initial={initial_epochs_per_step}, min={min_epochs_per_step}, max={max_epochs_per_step}")
+        
+        # Minimum training period before allowing hyperparameter updates
+        self.min_training_steps = self.config.get('min_training_steps', 3)  # Default to 3 steps
+        self.steps_since_last_update = 0  # Track steps since the last hyperparameter update
         
         # Save RL brain configuration
         self.brain_save_dir = config.get('brain_save_dir', 'models/rl_brains')
@@ -96,6 +128,9 @@ class HPOEnvironment(gym.Env):
         # Introduce a minimum training period before allowing hyperparameter updates
         self.min_training_steps = self.config.get('min_training_steps', 10)  # Default to 10 steps
         self.steps_since_last_update = 0  # Track steps since the last hyperparameter update
+
+        # For dynamic RL step scheduling
+        self.last_intervention_val_loss = None
         
     def _create_action_mappings(self):
         """Create mappings between action indices and actual hyperparameter values"""
@@ -166,16 +201,33 @@ class HPOEnvironment(gym.Env):
         self.current_step += 1
         self.total_steps += 1
 
+        # Initialize stagnation status
+        stagnation_detected = False
+
         # Track loss history to check stagnation
         if self.history['val_loss']:
             self.val_loss_history.append(self.history['val_loss'][-1])
-        
-        # Check for stagnation
-        stagnation_detected = (len(self.val_loss_history) == self.stagnation_epochs and
-                              max(self.val_loss_history) - min(self.val_loss_history) < self.stagnation_threshold)
-        
-        if stagnation_detected:
-            logger.info(f"Stagnation detected: loss diff {max(self.val_loss_history) - min(self.val_loss_history):.6f} < threshold {self.stagnation_threshold}")
+            
+            # Dynamic RL step scheduling - record validation loss 
+            if self.use_dynamic_steps and self.history['val_loss'][-1] is not None:
+                self.rl_step_scheduler.record_validation_loss(self.history['val_loss'][-1])
+                
+                # Check if we need to adjust the intervention frequency and epochs_per_step
+                if self.rl_step_scheduler.should_adjust_steps():
+                    # Get both updated values from the scheduler
+                    self.training_timesteps, self.epochs_per_step = self.rl_step_scheduler.adjust_steps()
+                    logger.info(f"Dynamic scheduling updated parameters:")
+                    logger.info(f"  - Training timesteps: {self.training_timesteps} steps")
+                    logger.info(f"  - Epochs per step: {self.epochs_per_step} epochs")
+                    
+                    # The training_timesteps determines how often we check for stagnation
+                    # and how often the agent is allowed to change hyperparameters
+                    # This directly impacts the RL training through the training_timesteps in the agent
+                    
+                    # Use stagnation detection from the scheduler instead of redundant check
+                    stagnation_detected = self.rl_step_scheduler.is_stagnating()
+                    if stagnation_detected:
+                        logger.info(f"Stagnation detected by the scheduler")
 
         hyperparams_changed = False
         # Increment steps since last update
@@ -184,9 +236,21 @@ class HPOEnvironment(gym.Env):
         # Initialize is_new_config to False to ensure it is always defined
         is_new_config = False
 
-        # Ensure RL agent explores new hyperparameters
-        # Modify the logic to encourage exploration
-        if stagnation_detected and self.steps_since_last_update >= self.min_training_steps:
+        # Only consider hyperparameter changes if:
+        # 1. Stagnation is detected OR
+        # 2. We've reached the intervention frequency steps since last change
+        # This enforces the intervention_frequency parameter
+        should_consider_hyperparams_update = (
+            stagnation_detected or 
+            self.steps_since_last_update >= self.training_timesteps
+        ) and self.steps_since_last_update >= self.min_training_steps
+
+        # Process hyperparameter updates from the RL agent if conditions are met
+        if should_consider_hyperparams_update:
+            logger.info(f"Considering hyperparameter update (stagnation: {stagnation_detected}, " +
+                        f"steps since update: {self.steps_since_last_update}, " +
+                        f"min steps between interventions: {self.training_timesteps})")
+            
             # Convert action to hyperparameters
             new_hyperparams = self.action_to_hp_dict(action)
 
@@ -212,15 +276,22 @@ class HPOEnvironment(gym.Env):
                 else:
                     logger.debug("Generated hyperparameters are equivalent to current ones, not counted as new")
 
-        # Remove functionality to skip training and validation
-        # Always perform training and validation regardless of hyperparameter changes
-        hyperparams_changed = True  # Force training and validation to always occur
-
-        # Training and evaluation can be separate operations
-        if hyperparams_changed:
+        # Fixed: Only train when hyperparameters have changed or during the initial run
+        # This addresses the TODO comment by avoiding redundant training with unchanged hyperparameters
+        should_train = hyperparams_changed or self.current_step == 1
+        
+        if should_train:
             # Train for the specified number of epochs using the CNNTrainer
             train_metrics = None
-            for _ in range(self.epochs_per_step):
+            
+            # Log the number of epochs we'll be training for
+            if self.epochs_per_step > 1:
+                logger.info(f"Training for {self.epochs_per_step} CNN epochs")
+            
+            # Train for multiple epochs but only retain final metrics
+            for epoch in range(self.epochs_per_step):
+                epoch_number = epoch + 1
+                logger.info(f"  - Training CNN epoch {epoch_number}/{self.epochs_per_step}")
                 # Use CNNTrainer's train_epoch method
                 train_metrics = self.cnn_trainer.train_epoch()
 
@@ -244,6 +315,23 @@ class HPOEnvironment(gym.Env):
             self.history['train_acc'].append(train_acc)
             self.history['train_loss'].append(train_loss)
             self.history['hyperparams'].append(copy.deepcopy(self.current_hyperparams))
+        else:
+            # Reuse previous metrics when hyperparameters haven't changed
+            logger.info("Skipping training - hyperparameters unchanged")
+            
+            # Use the most recent metrics from history
+            if self.history['val_acc'] and self.history['train_acc']:
+                train_acc = self.history['train_acc'][-1]
+                train_loss = self.history['train_loss'][-1]
+                val_acc = self.history['val_acc'][-1]
+                val_loss = self.history['val_loss'][-1]
+                
+                # Still update history to keep proper tracking
+                self.history['val_acc'].append(val_acc)
+                self.history['val_loss'].append(val_loss)
+                self.history['train_acc'].append(train_acc)
+                self.history['train_loss'].append(train_loss)
+                self.history['hyperparams'].append(copy.deepcopy(self.current_hyperparams))           
 
         # Calculate reward
         reward = self._calculate_reward(val_acc, val_loss, is_new_config)
@@ -391,10 +479,8 @@ class HPOEnvironment(gym.Env):
 
         logger.info(f"HPO Environment - Step {self.current_step}/{self.max_steps}")
         
-        # Replace Rich Table with plain logging for hyperparameters
         print('\n')
         logger.info("Current Hyperparameters:")
-        print('\n')
         for name, value in self.current_hyperparams.items():
             if isinstance(value, float):
                 logger.info(f"{name}: {value:.6f}")
@@ -405,7 +491,6 @@ class HPOEnvironment(gym.Env):
         if self.history['val_acc']:
             print('\n')
             logger.info("Performance Metrics:")
-            print('\n')
             logger.info(f"Val Accuracy: Current: {self.history['val_acc'][-1]:.4f}, Best: {self.best_val_acc:.4f}")
             logger.info(f"Val Loss: Current: {self.history['val_loss'][-1]:.4f}, Best: {self.best_val_loss:.4f}")
             if len(self.history['train_acc']) > 0:
@@ -415,7 +500,6 @@ class HPOEnvironment(gym.Env):
         # Display reward
         if self.history['rewards']:
             reward = self.history['rewards'][-1]
-            reward_color = "green" if reward > 0 else "red"
             logger.info(f"Reward: {reward:.4f}")
         
         # Show no improvement counter
@@ -442,6 +526,10 @@ class HPOEnvironment(gym.Env):
         # Check if the previous run was bad (reached patience limit without improvement)
         bad_previous_run = self.no_improvement_count >= self.patience
         
+        # Remember previous best metrics if we're loading episodes from previous runs
+        prev_best_val_acc = self.best_val_acc
+        prev_best_val_loss = self.best_val_loss
+        
         # Reset training state
         self.current_step = 0
         self.no_improvement_count = 0
@@ -462,17 +550,28 @@ class HPOEnvironment(gym.Env):
             }
             if bad_previous_run:
                 logger.info(f"Previous run reached patience limit. Resetting hyperparameters.")
-            logger.info(f"Reset environment with default hyperparameters: {get_hyperparams_hash(self.current_hyperparams)}")
+            logger.info(f"Reset environment with default hyperparameters, hashmap is: {get_hyperparams_hash(self.current_hyperparams)}")
         else:
-            logger.info(f"Keeping existing hyperparameters during reset: {get_hyperparams_hash(self.current_hyperparams)}")
+            logger.info(f"Keeping existing hyperparameters during reset, hashmap is: {get_hyperparams_hash(self.current_hyperparams)}")
         
         # Apply hyperparameters to the model
         self.cnn_trainer.model.update_hyperparams(self.current_hyperparams)
         self.cnn_trainer.optimizer = self.cnn_trainer.model.get_optimizer()
         
-        # Reset best metrics
-        self.best_val_acc = 0.0
-        self.best_val_loss = float('inf')
+        # Determine if we're loading episodes from previous runs
+        loading_previous_episodes = options and options.get('loading_previous_episodes', False)
+
+        # Reset best metrics, preserving previous values if requested
+        if loading_previous_episodes and prev_best_val_acc > 0:
+            # Keep previous best metrics when loading from earlier training
+            self.best_val_acc = prev_best_val_acc
+            self.best_val_loss = prev_best_val_loss
+            logger.info(f"Preserving best metrics from previous runs: val_acc={self.best_val_acc:.4f}, val_loss={self.best_val_loss:.4f}")
+        else:
+            # Start fresh with reset metrics
+            self.best_val_acc = 0.0
+            self.best_val_loss = float('inf')
+            
         self.best_hyperparams = copy.deepcopy(self.current_hyperparams)
         
         # Reset history
@@ -532,7 +631,7 @@ class HPOEnvironment(gym.Env):
 
     def save_agent_brain(self, best=False) -> str:
         """
-        Save the RL agent brain.
+        Save the RL agent brain with enhanced naming scheme.
         
         Args:
             best: Whether to save as a "best" brain
@@ -546,16 +645,32 @@ class HPOEnvironment(gym.Env):
             
         try:
             timestamp = int(time.time())
+            session_id = getattr(self, 'session_id', timestamp) # Use session ID if exists
             
-            # Different naming for best brains
-            if best:
-                filename = "hpo_env_best_brain.zip"
-                logger.info(f"Saving best RL brain with episode reward: {self.best_episode_reward:.4f}")
+            # Get current reward value for filename
+            if self.history['rewards']:
+                current_reward = sum(self.history['rewards'][-self.current_step:])
             else:
-                filename = f"hpo_env_brain_step_{self.total_steps}.zip"
-                logger.info(f"Saving periodic RL brain at step {self.total_steps}")
+                current_reward = 0.0
+                
+            # Different naming for best brains - include reward value in filename
+            if best:
+                # Keep the old best brain file, but create a new one with timestamp and reward
+                best_reward = self.best_episode_reward
+                filename = f"hpo_env_best_brain_r{best_reward:.2f}_{timestamp}.zip"
+                # Also save to the standard best brain location
+                standard_best = "hpo_env_best_brain.zip"
+                logger.info(f"Saving best RL brain with episode reward: {best_reward:.4f}")
+                
+                # Save to standard location
+                standard_path = os.path.join(self.brain_save_dir, standard_best)
+                self.agent.save(standard_path)
+            else:
+                # For periodic saves, include reward in filename
+                filename = f"hpo_env_brain_s{session_id}_r{current_reward:.2f}_{timestamp}.zip"
+                logger.info(f"Saving periodic RL brain at step {self.total_steps} with reward {current_reward:.4f}")
             
-            # Full path
+            # Full path for the new file
             brain_path = os.path.join(self.brain_save_dir, filename)
             
             # Save the brain
@@ -566,11 +681,12 @@ class HPOEnvironment(gym.Env):
             metadata = {
                 "total_steps": self.total_steps,
                 "timestamp": timestamp,
+                "session_id": session_id,
+                "reward": float(current_reward),
                 "best_val_acc": float(self.best_val_acc),
                 "best_val_loss": float(self.best_val_loss),
                 "current_hyperparams": self.current_hyperparams,
                 "best_hyperparams": self.best_hyperparams,
-                "episode_reward": float(self.history['rewards'][-1]) if self.history['rewards'] else 0.0,
                 "no_improvement_count": self.no_improvement_count,
                 "explored_configs_count": len(self.explored_configs)
             }

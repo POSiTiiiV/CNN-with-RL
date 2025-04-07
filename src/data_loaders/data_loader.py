@@ -237,8 +237,11 @@ def warmup_dataloader(dataloader, name=""):
     logger.info(f"Warming up {name} dataloader...")
     start_time = time.time()
     try:
-        for i, _ in enumerate(tqdm(dataloader, desc=f"Warming up {name} dataloader", total=min(3, len(dataloader)))):
-            if i >= 2:  # Process just 3 batches
+        # Remove tqdm progress bar and process silently
+        batch_count = 0
+        for _, _ in dataloader:
+            batch_count += 1
+            if batch_count >= 3:  # Process just 3 batches
                 break
         elapsed = time.time() - start_time
         logger.info(f"{name} DataLoader warmup completed in {elapsed:.2f}s")

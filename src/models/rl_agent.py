@@ -3,6 +3,7 @@ import time
 import numpy as np
 import json
 import logging
+import torch
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import BaseCallback
 from collections import deque
@@ -100,7 +101,7 @@ class HyperParameterOptimizer:
 
         # Extract core configuration parameters
         self.learning_rate = config.get('learning_rate', 3e-4)
-        self.n_steps = config.get('n_steps', 1024)
+        self.n_steps = config.get('n_steps', 64)  # Reduced from 1024 to 64 to avoid excessive CNN training
         self.batch_size = config.get('batch_size', 64)
         self.n_epochs = config.get('n_epochs', 10)
         self.gamma = config.get('gamma', 0.99)
@@ -124,10 +125,33 @@ class HyperParameterOptimizer:
         self.min_intervention_threshold = config.get('min_intervention_threshold', 0.3)
         self.max_intervention_threshold = config.get('max_intervention_threshold', 0.8)
         
-        # Training parameters
+        # Training parameters - use environment's RL step settings if available
+        # Default values in case the environment doesn't have RL step scheduler
         self.training_timesteps_min = config.get('training_timesteps_min', 500)
         self.training_timesteps_max = config.get('training_timesteps_max', 10000)
-        self.training_timesteps = self.training_timesteps_min
+        
+        # Sync with environment's RL step scheduler if available
+        if hasattr(env, 'rl_step_scheduler'):
+            # Use the environment's RL step configuration to set training timesteps
+            # This creates a direct connection between the two systems
+            rl_steps_ratio = 100  # How many training timesteps per RL step
+            
+            # Scale the min/max/initial RL steps to appropriate training timesteps
+            self.training_timesteps_min = env.rl_step_scheduler.min_training_timesteps
+            self.training_timesteps_max = env.rl_step_scheduler.max_training_timesteps
+            initial_training_steps = env.rl_step_scheduler.training_timesteps
+            
+            logger.info(f"Synchronized RL agent training parameters with environment's RL step scheduler:")
+            logger.info(f"  - Min training timesteps: {self.training_timesteps_min}")
+            logger.info(f"  - Max training timesteps: {self.training_timesteps_max}")
+            logger.info(f"  - Initial training timesteps: {initial_training_steps}")
+            
+            # Start with the initial value
+            self.training_timesteps = initial_training_steps
+        else:
+            # Fall back to the config values if environment doesn't have a scheduler
+            self.training_timesteps = self.training_timesteps_min
+            
         self.training_step = 0
         
         # Ensure brain save directory exists
@@ -373,7 +397,7 @@ class HyperParameterOptimizer:
         print('\n')
 
         # Replace Rich Table with plain logging for training statistics
-        logger.info("Training Statistics:")
+        logger.info("Training Statistics:") # TODO: remove this or use a better format
         logger.info(f"Experiences: {experience_count}")
         logger.info(f"Episodes: {len(self.collected_episodes)}")
         logger.info(f"Mean reward: {mean_reward:.4f}")
@@ -385,24 +409,63 @@ class HyperParameterOptimizer:
         logger.info("Starting PPO Training")
         print('\n')
         
+        # Get the training_timesteps from the environment if available
+        # This ensures we're using the dynamically adjusted value from the scheduler
+        if hasattr(self.env, 'training_timesteps'):
+            # Use the environment's current training_timesteps value
+            total_steps = self.env.training_timesteps
+            logger.info(f"Using environment's training_timesteps: {total_steps}")
+        else:
+            # Fall back to our own value if the environment doesn't provide one
+            total_steps = self.training_timesteps
+            logger.info(f"Using agent's training_timesteps: {total_steps}")
+        
         # Create a progress bar for training
-        total_steps = self.training_timesteps
-        progress_interval = max(1, total_steps // 40)  # Report progress ~40 times
+        progress_interval = max(1, total_steps // 100)
         logger.info(f"Training for {total_steps} timesteps...")
         
         # Create a callback for training progress
         progress_callback = ProgressCallback(total_steps, progress_interval)
-
         
-        # Train the agent - don't use console.status here as it creates a live display
-        # that would conflict with the progress callback's own live display
+        # Add memory protection - move to CPU if experiencing CUDA OOM errors
         try:
+            # Try training the agent - since agent is on CPU, any CUDA errors are from the environment (CNN)
             self.agent.learn(
-                total_timesteps=self.training_timesteps, 
+                total_timesteps=total_steps, 
                 reset_num_timesteps=False,
                 callback=progress_callback
             )
             logger.info(f"Training completed. Average reward: {mean_reward:.4f}")
+            
+        except RuntimeError as e:
+            if "CUDA" in str(e) and ("out of memory" in str(e) or "CUBLAS_STATUS_EXECUTION_FAILED" in str(e)):
+                logger.warning(f"CUDA out of memory error during CNN training in environment step. Clearing GPU memory and reducing batch size.")
+                
+                # Clear CUDA cache
+                torch.cuda.empty_cache()
+                
+                # Notify environment of the CUDA error if it has a method to handle it
+                if hasattr(self.env, 'handle_cuda_oom'):
+                    logger.info("Instructing environment to reduce CNN memory usage")
+                    self.env.handle_cuda_oom()
+                
+                # Try again with reduced steps
+                reduced_steps = max(500, total_steps // 4)
+                logger.info(f"Retrying with reduced training steps: {reduced_steps}")
+                
+                try:
+                    self.agent.learn(
+                        total_timesteps=reduced_steps, 
+                        reset_num_timesteps=False,
+                        callback=progress_callback
+                    )
+                    logger.info(f"Training completed with reduced steps ({reduced_steps}). Average reward: {mean_reward:.4f}")
+                except Exception as retry_e:
+                    logger.exception(f"Error during training retry after CUDA OOM: {str(retry_e)}")
+                    return False
+            else:
+                logger.exception(f"Error during training: {str(e)}")
+                return False
         except Exception as e:
             if "Training ended" in str(e):
                 logger.warning("Training ended by callback")
@@ -485,24 +548,6 @@ class HyperParameterOptimizer:
         
         logger.info(f"Updated parameters - Intervention threshold: {self.intervention_threshold:.2f}, " +
                     f"Training timesteps: {self.training_timesteps}")
-
-    def update_cnn_epoch(self, epoch: int) -> None:
-        """
-        Update the current CNN training epoch to adjust RL training parameters.
-        
-        Args:
-            epoch: Current CNN training epoch
-        """
-        # Adjust training steps based on CNN training progress
-        if epoch < 80:
-            # Conservative in early stages
-            self.training_timesteps = self.training_timesteps_min
-        elif epoch < 160:
-            # Increase as we progress
-            self.training_timesteps = int(self.training_timesteps_min * 1.5)
-        elif epoch < 200:
-            # More substantial training as we have more data
-            self.training_timesteps = int(self.training_timesteps_min * 2)
 
     def save_brain(self, filepath: Optional[str] = None) -> Optional[str]:
         """
@@ -603,6 +648,12 @@ class HyperParameterOptimizer:
                 self.intervention_threshold = metadata.get("intervention_threshold", self.intervention_threshold)
                 self.training_timesteps = metadata.get("training_timesteps", self.training_timesteps)
                 
+                # Store best validation metrics from previous training if available
+                if "best_val_acc" in metadata and "best_val_loss" in metadata:
+                    self.best_val_acc = metadata.get("best_val_acc", 0.0)
+                    self.best_val_loss = metadata.get("best_val_loss", float('inf'))
+                    logger.info(f"Loaded best metrics from previous training: val_acc={self.best_val_acc:.4f}, val_loss={self.best_val_loss:.4f}")
+                
             logger.info(f"Loaded {len(self.collected_episodes)} episodes from {self.episodes_save_path} (format version {loaded_data.get('version', 1)})")
             
             # Enforce memory limit
@@ -660,7 +711,9 @@ class HyperParameterOptimizer:
                 "episode_count": len(serializable_episodes),
                 "metadata": {
                     "intervention_threshold": self.intervention_threshold,
-                    "training_timesteps": self.training_timesteps
+                    "training_timesteps": self.training_timesteps,
+                    "best_val_acc": getattr(self, 'best_val_acc', 0.0),
+                    "best_val_loss": getattr(self, 'best_val_loss', float('inf'))
                 },
                 "episodes": serializable_episodes
             }

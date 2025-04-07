@@ -19,7 +19,7 @@ class PretrainedCNN(nn.Module):
         # Extract configuration parameters
         self.num_classes = config.get('num_classes', 10)
         self.fc_layers = config.get('fc_layers', [512, 256])
-        self.dropout_rate = config.get('dropout_rate', 0.5)
+        self.dropout_rate = config.get('dropout_rate', 0.3)
         self.learning_rate = config.get('learning_rate', 0.001)
         self.weight_decay = config.get('weight_decay', 1e-4)
         self.optimizer_type = config.get('optimizer_type', 'adam')
@@ -76,7 +76,7 @@ class PretrainedCNN(nn.Module):
         # Pass through custom head
         x = self.head(x)
         return x
-
+    # TODO: if it was the initial run, after loading rl episodes and we reset the environemnt and hyperparameters, then we shouldnt call update_hyperparameters() as we know the model has the default hyperparameters
     def update_hyperparams(self, hyperparams):
         """
         Update model hyperparameters dynamically

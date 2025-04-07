@@ -278,27 +278,35 @@ def main():
             config=config["training"]
         )
         
-        # Create hyperparameter optimization environment
-        hpo_env = HPOEnvironment(
-            cnn_trainer=cnn_trainer,
-            config=config["env"],
-            render_mode="human" if config.get("verbose", False) else None
-        )
+        # Initialize HPO environment with CNN trainer
+        env = HPOEnvironment(cnn_trainer, config['env'])
         
         # Create RL optimizer
-        rl_optimizer = HyperParameterOptimizer(
-            env=hpo_env,
-            config=config["rl"]
-        )
+        rl_optimizer = HyperParameterOptimizer(env, config['rl'])
         
-        # Load pre-trained RL brain if specified
+        # Determine if there are previous episodes to load
+        loading_episodes = os.path.exists('logs/rl_episodes.json')
+        
+        # Handle RL brain loading (completely separate from episode loading)
         if args.rl_brain:
             brain_path = args.rl_brain
             logger.info(f"Loading RL brain from {brain_path}...")
             if rl_optimizer.load_brain(brain_path):
                 logger.info(f"✓ Successfully loaded RL brain")
             else:
-                logger.error(f"✗ Failed to load RL brain, using new agent")
+                logger.warning(f"Failed to load RL brain from {brain_path}")
+
+        # Handle environment reset and previous episodes (separate from brain loading)
+        # We want to preserve metrics if previous episodes exist, regardless of RL brain loading
+        if loading_episodes:
+            observation, info = env.reset(options={'loading_previous_episodes': True})
+            logger.info("Environment reset with preserved best metrics from previous episodes")
+        else:
+            observation, info = env.reset()
+            logger.info("Environment reset with fresh metrics (no previous episodes found)")
+        
+        # Set the agent in the environment for direct saving
+        env.set_agent(rl_optimizer.agent)
         
         # Create model trainer
         trainer = ModelTrainer(

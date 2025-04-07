@@ -96,24 +96,42 @@ class CNNTrainer:
                 
                 logger.info(f"GPU Memory: Total={total_memory:.0f}MB, Free={free_memory:.0f}MB, Used={allocated_memory:.0f}MB")
                 
-                # If free memory is low and batch size is high, reduce batch size
-                if free_memory < 2000 and self.batch_size > 8:  # Threshold of 2GB and batch size > 8
+                # If free memory is low, reduce batch size and force CPU if necessary
+                if free_memory < 1000:  # Less than 1GB free
                     original_batch_size = self.batch_size
-                    # Reduce batch size based on available memory
-                    if free_memory < 1000:
-                        self.batch_size = max(1, self.batch_size // 4)  # Aggressive reduction
-                    elif free_memory < 1500:
-                        self.batch_size = max(2, self.batch_size // 2)  # Moderate reduction
-                    else:
-                        self.batch_size = max(4, int(self.batch_size * 0.75))  # Mild reduction
+                    original_device = self.device
+                    
+                    # Aggressive memory management - move to CPU if very low memory
+                    if free_memory < 500:  # Less than 500MB free
+                        logger.warning(f"⚠️ Critical GPU memory shortage: {free_memory:.0f}MB free. Moving model to CPU.")
+                        self.model = self.model.to('cpu')
+                        self.device = torch.device('cpu')
+                        # Recreate optimizer to update device references
+                        self.optimizer = self.get_optimizer()
+                        self.use_mixed_precision = False
+                        self.scaler = None
+                    
+                    # Reduce batch size significantly
+                    self.batch_size = max(1, self.batch_size // 4)  # Aggressive reduction
+                    
+                    # Update model hyperparams
+                    self.model.hyperparams['batch_size'] = self.batch_size
+                    
+                    logger.warning(f"⚠️ Memory management: Reduced batch size from {original_batch_size} to {self.batch_size}")
+                    if original_device != self.device:
+                        logger.warning(f"⚠️ Memory management: Changed device from {original_device} to {self.device}")
+                elif free_memory < 2000:  # Less than 2GB free
+                    original_batch_size = self.batch_size
+                    # Moderate memory management - reduce batch size
+                    self.batch_size = max(2, self.batch_size // 2)  # Moderate reduction
                     
                     # Update model hyperparams
                     self.model.hyperparams['batch_size'] = self.batch_size
                     
                     logger.warning(f"⚠️ Reduced batch size from {original_batch_size} to {self.batch_size} due to limited GPU memory")
-                    
-                    # Force CUDA cache clear
-                    torch.cuda.empty_cache()
+                
+                # Force CUDA cache clear
+                torch.cuda.empty_cache()
                 
             except Exception as e:
                 logger.warning(f"Warning: Unable to check GPU memory: {str(e)}")
