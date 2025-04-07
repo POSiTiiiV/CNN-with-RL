@@ -9,13 +9,14 @@ import matplotlib.pyplot as plt
 from typing import Dict, List, Any, Optional, Union, Tuple
 import copy
 import wandb
-from tqdm import tqdm
-import logging
+# Removing Rich imports
 from io import StringIO
+from loguru import logger
 from ..utils.utils import create_observation, enhance_observation_with_trends, calculate_performance_trends, is_significant_hyperparameter_change
 
-# Initialize logger
-logger = logging.getLogger(__name__)
+# Initialize standard logging instead of rich console
+import logging
+logging_console = logging.getLogger("trainer")
 
 class ModelTrainer:
     """
@@ -45,25 +46,12 @@ class ModelTrainer:
         self.max_epochs = self.config_training.get('max_epochs', 100)
         self.early_stopping_patience = self.config_training.get('early_stopping_patience', 25)
         self.checkpoint_frequency = self.config_training.get('checkpoint_frequency', 5)
-        
-        # New RL intervention parameters
-        self.min_epochs_before_first_intervention = self.config_training.get('min_epochs_before_first_intervention', 10)
-        self.epochs_between_interventions = self.config_training.get('epochs_between_interventions', 15)
-        self.min_epochs_per_evaluation = self.config_training.get('min_epochs_per_evaluation', 5)
+        self.min_epochs_before_intervention = self.config_training.get('min_epochs_before_intervention', 10)
         
         # RL intervention parameters
         self.metric_window_size = self.config_training.get('metric_window_size', 5)  # Rolling window size
         self.improvement_threshold = self.config_training.get('improvement_threshold', 0.002)  # Minimum expected improvement
-        
-        # Penalties for excessive major interventions
-        self.major_intervention_penalty = self.config_rl.get('major_intervention_penalty', 0.5)
-        self.consecutive_major_interventions_penalty = self.config_rl.get('consecutive_major_interventions_penalty', 1.0)
-        
-        # Tracking for intervention penalties
-        self.consecutive_major_interventions = 0
-        self.total_major_interventions = 0
-        self.last_intervention_was_major = False
-        self.intervention_cooldown = 0  # Additional cooldown after major interventions
+        self.intervention_frequency = self.config_training.get('intervention_frequency', 5)
         
         # Setup logging
         self.log_dir = self.config_logging.get('log_dir', 'logs')
@@ -81,13 +69,11 @@ class ModelTrainer:
             'hyperparameters': [],
             'rl_interventions': [],
             'time_per_epoch': [],
-            'timestamp': [],
-            'global_step': []  # Add global step tracking for continuous history across restarts
+            'timestamp': []
         }
         
         # Training state
         self.current_epoch = 0
-        self.global_epoch = 0  # Global epoch counter that persists across model restarts
         self.best_val_acc = 0.0
         self.best_val_loss = float('inf')
         self.epochs_without_improvement = 0
@@ -174,12 +160,14 @@ class ModelTrainer:
                     else:
                         self.epochs_without_improvement += 1
                     
-                    # Replace Rich Table with plain logging for epoch summary
-                    logger.info(f"Epoch {epoch+1}/{self.max_epochs} Summary:")
-                    logger.info(f"Training Loss: {train_metrics['loss']:.4f}, Validation Loss: {val_loss:.4f}")
-                    logger.info(f"Training Accuracy: {train_metrics['accuracy']:.4f}, Validation Accuracy: {val_acc:.4f}")
-                    logger.info(f"Epoch Time: {epoch_time:.1f}s")
-                    logger.info(f"No improvement count: {self.epochs_without_improvement}/{self.early_stopping_patience}")
+                    # Create a summary for the epoch using standard logging
+                    epoch_summary = f"\n--- Epoch {epoch+1}/{self.max_epochs} ---\n"
+                    epoch_summary += f"Training Loss: {train_metrics['loss']:.4f}, Accuracy: {train_metrics['accuracy']:.4f}\n"
+                    epoch_summary += f"Validation Loss: {val_loss:.4f}, Accuracy: {val_acc:.4f}\n"
+                    epoch_summary += f"Time: {epoch_time:.1f}s\n"
+                    epoch_summary += f"No improvement: {self.epochs_without_improvement}/{self.early_stopping_patience}"
+                    
+                    logger.info(epoch_summary)
                     
                     # Show improvement message if applicable
                     if improved:
@@ -194,14 +182,20 @@ class ModelTrainer:
                     self._log_to_wandb(epoch, train_metrics, val_metrics, epoch_time)
                     
                     # Check if RL intervention is needed
-                    if self._check_for_intervention():
-                        self.last_intervention_epoch = epoch + 1
+                    epochs_since_intervention = epoch + 1 - self.last_intervention_epoch
+                    if epochs_since_intervention >= self.intervention_frequency:
+                        logger.info("Checking if RL intervention is needed...")
+                        if self._check_for_intervention():
+                            self.last_intervention_epoch = epoch + 1
+                        else:
+                            logger.info(f"No intervention needed at epoch {epoch+1}")
                 else:
                     # For training only metrics
-                    logger.info(f"Epoch {epoch+1}/{self.max_epochs} (Training Only) Summary:")
-                    logger.info(f"Training Loss: {train_metrics['loss']:.4f}")
-                    logger.info(f"Training Accuracy: {train_metrics['accuracy']:.4f}")
-                    logger.info(f"Epoch Time: {epoch_time:.1f}s")
+                    epoch_summary = f"\n--- Epoch {epoch+1}/{self.max_epochs} (Training Only) ---\n"
+                    epoch_summary += f"Training Loss: {train_metrics['loss']:.4f}, Accuracy: {train_metrics['accuracy']:.4f}\n"
+                    epoch_summary += f"Time: {epoch_time:.1f}s"
+                    
+                    logger.info(epoch_summary)
                     
                     # Log to wandb (training only)
                     self._log_to_wandb(epoch, train_metrics, None, epoch_time)
@@ -222,14 +216,16 @@ class ModelTrainer:
             
             total_time = time.time() - self.start_time
             
-            # Replace Rich Panel with plain logging for training summary
-            print('\n')
-            logger.info("Training Summary:")
-            print('\n')
-            logger.info(f"Total time: {total_time:.1f}s")
-            logger.info(f"Best validation accuracy: {self.best_val_acc:.4f}")
-            logger.info(f"Total epochs: {self.current_epoch + 1}")
-            logger.info(f"RL interventions: {len(self.history['rl_interventions'])}")
+            # Final summary
+            final_summary = (
+                f"\n----- Training Summary -----\n"
+                f"Total time: {total_time:.1f}s\n"
+                f"Best validation accuracy: {self.best_val_acc:.4f}\n"
+                f"Total epochs: {self.current_epoch + 1}\n"
+                f"RL interventions: {len(self.history['rl_interventions'])}\n"
+                f"--------------------------"
+            )
+            logger.info(final_summary)
             
             # Log final summary to wandb
             if self.wandb_initialized:
@@ -321,21 +317,9 @@ class ModelTrainer:
         Returns:
             bool: True if intervention occurred, False otherwise
         """
-        # Only consider intervention after minimum epochs for first intervention
-        if self.current_epoch < self.min_epochs_before_first_intervention:
-            logger.info(f"Skipping intervention check: not enough epochs ({self.current_epoch}/{self.min_epochs_before_first_intervention})")
-            return False
-            
-        # Check if enough epochs have passed since last intervention
-        epochs_since_intervention = self.current_epoch + 1 - self.last_intervention_epoch
-        if epochs_since_intervention < self.epochs_between_interventions:
-            logger.info(f"Skipping intervention check: too soon since last intervention ({epochs_since_intervention}/{self.epochs_between_interventions})")
-            return False
-        
-        # Check for additional cooldown after major interventions
-        if self.intervention_cooldown > 0:
-            logger.info(f"Skipping intervention check: in major intervention cooldown period ({self.intervention_cooldown} epochs remaining)")
-            self.intervention_cooldown -= 1
+        # Only consider intervention after minimum epochs
+        if self.current_epoch < self.min_epochs_before_intervention:
+            logger.info(f"Skipping intervention check: not enough epochs ({self.current_epoch}/{self.min_epochs_before_intervention})")
             return False
             
         # Calculate performance trends
@@ -350,21 +334,14 @@ class ModelTrainer:
         is_stagnating = trend_data['is_stagnating'] 
         improvement_rate = trend_data['improvement_rate']
         
-        # Replace Rich Table with plain logging for performance trends
-        print('\n')
-        logger.info("Performance Trends:")
-        print('\n')
-        logger.info(f"Stagnating: {'Yes' if is_stagnating else 'No'}")
-        logger.info(f"Improvement Rate: {improvement_rate:.5f}")
-        
-        # Log intervention statistics
-        if self.intervention_count > 0:
-            logger.info(f"Intervention Statistics:")
-            logger.info(f"Total interventions: {self.intervention_count}")
-            logger.info(f"Total major interventions: {self.total_major_interventions}")
-            logger.info(f"Consecutive major interventions: {self.consecutive_major_interventions}")
-            if self.consecutive_major_interventions >= 2:
-                logger.info(f"⚠️ Warning: Multiple consecutive major interventions detected!")
+        # Log performance trends
+        trend_summary = (
+            f"\n----- Performance Trends -----\n"
+            f"Stagnating: {'Yes' if is_stagnating else 'No'}\n"
+            f"Improvement Rate: {improvement_rate:.5f}\n"
+            f"-----------------------------"
+        )
+        logger.info(trend_summary)
         
         # Prepare observation for RL agent
         logger.info("Querying RL agent for decision...")
@@ -400,7 +377,7 @@ class ModelTrainer:
             return False
             
         # Apply new hyperparameters
-        logger.info(f"RL agent intervening at epoch {self.current_epoch+1} (global epoch {self.global_epoch+1})")
+        logger.info(f"RL agent intervening at epoch {self.current_epoch+1}")
         
         # Increment intervention counter
         self.intervention_count += 1
@@ -427,48 +404,32 @@ class ModelTrainer:
         # Determine if the intervention is major or minor
         major_intervention = self._is_major_intervention(new_hyperparams)
         
-        # Update major intervention tracking
         if major_intervention:
-            self.total_major_interventions += 1
-            if self.last_intervention_was_major:
-                self.consecutive_major_interventions += 1
-            else:
-                self.consecutive_major_interventions = 1
-                
-            # Set additional cooldown for major interventions
-            self.intervention_cooldown = max(5, int(self.epochs_between_interventions * 0.5))
-            
-            logger.info(f"Major intervention #{self.total_major_interventions} detected, restarting training from scratch")
-            logger.info(f"Setting additional cooldown of {self.intervention_cooldown} epochs")
+            logger.info("Major intervention detected, restarting training from scratch")
             self._restart_training(new_hyperparams)
         else:
-            self.consecutive_major_interventions = 0
             logger.info("Minor intervention detected, continuing training")
             self._apply_hyperparams(new_hyperparams)
         
-        # Store this intervention type for next time
-        self.last_intervention_was_major = major_intervention
-        
-        # Replace Rich Table with plain logging for hyperparameter changes
-        print('\n')
-        logger.info("Hyperparameter Changes:")
+        # Log hyperparameter changes
+        hp_changes = "\n----- Hyperparameter Changes -----\n"
         for key, new_val in new_hyperparams.items():
             old_val = old_hyperparams.get(key, "N/A")
             if isinstance(new_val, float):
-                logger.info(f"{key}: Old Value: {old_val:.6f}, New Value: {new_val:.6f}")
+                hp_changes += f"{key}: {old_val:.6f if isinstance(old_val, float) else old_val} → {new_val:.6f}\n"
             else:
-                logger.info(f"{key}: Old Value: {old_val}, New Value: {new_val}")
+                hp_changes += f"{key}: {old_val} → {new_val}\n"
+        hp_changes += "-------------------------------"
+        logger.info(hp_changes)
         
-        # Record the intervention in history with tracking for global epoch
+        # Record the intervention in history
         intervention = {
             'epoch': self.current_epoch + 1,
-            'global_epoch': self.global_epoch + 1,
             'hyperparameters': new_hyperparams.copy(),
             'old_hyperparameters': old_hyperparams,  # Store old hyperparameters too
             'val_acc_before': val_acc,
             'val_loss_before': val_loss,
-            'is_major': major_intervention,
-            'consecutive_major_count': self.consecutive_major_interventions if major_intervention else 0
+            'is_major': major_intervention
         }
         self.history['rl_interventions'].append(intervention)
         self.history['hyperparameters'].append(new_hyperparams.copy())
@@ -482,12 +443,9 @@ class ModelTrainer:
                 
                 wandb.log({
                     "rl_intervention_epoch": self.current_epoch + 1,
-                    "rl_intervention_global_epoch": self.global_epoch + 1,
                     "rl_intervention_type": "major" if major_intervention else "minor",
                     "val_acc_before_intervention": val_acc,
-                    "intervention_count": self.intervention_count,
-                    "major_interventions_count": self.total_major_interventions,
-                    "consecutive_major_interventions": self.consecutive_major_interventions
+                    "intervention_count": self.intervention_count
                 }, step=current_step)
                 
                 for param_name, new_value in new_hyperparams.items():
@@ -532,66 +490,25 @@ class ModelTrainer:
         Args:
             new_hyperparams: New hyperparameters proposed by the RL agent
         """
-        # Store existing epoch count before reset
-        self.global_epoch = self.global_epoch + self.current_epoch + 1
-        logger.info(f"Incrementing global epoch counter to {self.global_epoch}")
-        
-        # Create backup of history for later visualization
-        history_backup = {
-            'epoch': self.history['epoch'].copy() if len(self.history['epoch']) > 0 else [],
-            'train_loss': self.history['train_loss'].copy() if len(self.history['train_loss']) > 0 else [],
-            'train_acc': self.history['train_acc'].copy() if len(self.history['train_acc']) > 0 else [],
-            'val_loss': self.history['val_loss'].copy() if len(self.history['val_loss']) > 0 else [],
-            'val_acc': self.history['val_acc'].copy() if len(self.history['val_acc']) > 0 else []
-        }
-        
-        # Update model and optimizer with new hyperparameters
         self.cnn_trainer.model.update_hyperparams(new_hyperparams)
         self.cnn_trainer.optimizer = self.cnn_trainer.model.get_optimizer()
-        
-        # Reset local training counters
         self.current_epoch = 0
         self.best_val_acc = 0.0
         self.best_val_loss = float('inf')
         self.epochs_without_improvement = 0
         
-        # Keep history but reset the per-iteration metrics
-        saved_hyperparameters = self.history['hyperparameters'].copy() if 'hyperparameters' in self.history else []
-        saved_interventions = self.history['rl_interventions'].copy() if 'rl_interventions' in self.history else []
-        
-        # Create complete history of all training runs for continuous tracking
-        if 'complete_history' not in self.history:
-            self.history['complete_history'] = []
-        
-        # Save the current history segment before resetting
-        if len(self.history['epoch']) > 0:
-            self.history['complete_history'].append({
-                'epoch': history_backup['epoch'],
-                'train_loss': history_backup['train_loss'],
-                'train_acc': history_backup['train_acc'],
-                'val_loss': history_backup['val_loss'],
-                'val_acc': history_backup['val_acc'],
-                'global_epoch_start': self.global_epoch - len(history_backup['epoch']),
-                'global_epoch_end': self.global_epoch - 1
-            })
-        
-        # Reset history for new training run
+        # Keep history but reset the key metrics
         self.history = {
             'epoch': [],
             'train_loss': [],
             'train_acc': [],
             'val_loss': [],
             'val_acc': [],
-            'hyperparameters': saved_hyperparameters,
-            'rl_interventions': saved_interventions,
+            'hyperparameters': self.history['hyperparameters'],
+            'rl_interventions': self.history['rl_interventions'],
             'time_per_epoch': [],
-            'timestamp': [],
-            'global_step': [],
-            'complete_history': self.history.get('complete_history', [])  # Keep track of all runs
+            'timestamp': []
         }
-        
-        logger.info(f"Training reset for major intervention. Global epoch is now {self.global_epoch}")
-        logger.info(f"History contains data for {len(self.history['complete_history'])} previous training runs")
 
     def _apply_hyperparams(self, new_hyperparams: Dict[str, Any]) -> None:
         """
@@ -672,25 +589,6 @@ class ModelTrainer:
                 # Minor changes were acceptable without intervention
                 reward = 0.2  # Small positive reward
         
-        # Update intervention history record with post-intervention metrics if this was an intervention
-        if intervened and 'epoch' in self.last_intervention_metrics:
-            intervention_epoch = self.last_intervention_metrics['epoch'] + 1  # +1 because epoch is 0-indexed
-            
-            # Find the corresponding intervention record in history
-            for i, intervention in enumerate(self.history['rl_interventions']):
-                if intervention['epoch'] == intervention_epoch:
-                    # Update the intervention record with post-intervention metrics
-                    self.history['rl_interventions'][i].update({
-                        'val_acc_after': current_val_acc,
-                        'val_loss_after': current_val_loss,
-                        'accuracy_improvement': acc_improvement,
-                        'loss_improvement': loss_improvement,
-                        'reward': reward,
-                        'epochs_until_evaluation': self.current_epoch - self.last_intervention_metrics['epoch']
-                    })
-                    logger.info(f"Updated intervention record with post-intervention metrics after {self.current_epoch - self.last_intervention_metrics['epoch']} epochs")
-                    break
-            
         # Create a complete SARST experience tuple
         if 'observation' in self.last_intervention_metrics and 'action' in self.last_intervention_metrics:
             # Get current observation (next state)
@@ -736,8 +634,6 @@ class ModelTrainer:
         if len(self.collected_experiences) == 1:  # First experience in a new episode
             logger.info(f"Starting new RL episode ({len(self.collected_episodes) + 1})")
         
-        # Determine color based on reward
-        reward_color = "green" if reward > 0 else "red"
         action_type = "intervention" if intervened else "non-intervention"
         logger.info(f"RL reward for {action_type}: {reward:.4f} "
                      f"(acc change: {acc_improvement:.4f}, loss change: {loss_improvement:.4f})")
@@ -955,13 +851,12 @@ class ModelTrainer:
     def _plot_training_history(self):
         """
         Plot training history and save to file.
-        Creates both regular plots and comprehensive plots that show training across restarts.
         """
         try:
             if len(self.history['epoch']) < 2:
-                logger.warning("Not enough data points to plot current training history")
+                logger.warning("Not enough data points to plot training history")
+                return
                 
-            # Create standard plots for current training run
             plt.figure(figsize=(12, 8))
             
             # Plot loss
@@ -969,7 +864,7 @@ class ModelTrainer:
             plt.plot(self.history['epoch'], self.history['train_loss'], label='Train Loss', color='blue')
             if self.history['val_loss'] and all(x is not None for x in self.history['val_loss']):
                 plt.plot(self.history['epoch'], self.history['val_loss'], label='Val Loss', color='orange')
-            plt.title('Training and Validation Loss (Current Run)')
+            plt.title('Training and Validation Loss')
             plt.xlabel('Epoch')
             plt.ylabel('Loss')
             plt.grid(True)
@@ -980,7 +875,7 @@ class ModelTrainer:
             plt.plot(self.history['epoch'], self.history['train_acc'], label='Train Acc', color='blue')
             if self.history['val_acc'] and all(x is not None for x in self.history['val_acc']):
                 plt.plot(self.history['epoch'], self.history['val_acc'], label='Val Acc', color='orange')
-            plt.title('Training and Validation Accuracy (Current Run)')
+            plt.title('Training and Validation Accuracy')
             plt.xlabel('Epoch')
             plt.ylabel('Accuracy')
             plt.grid(True)
@@ -990,143 +885,17 @@ class ModelTrainer:
             if self.history['rl_interventions']:
                 for intervention in self.history['rl_interventions']:
                     epoch = intervention['epoch']
-                    is_major = intervention.get('is_major', True)  # Default to True for compatibility
-                    color = 'red' if is_major else 'green'
-                    linestyle = '--' if is_major else ':'
-                    
                     plt.subplot(2, 1, 1)
-                    plt.axvline(x=epoch, color=color, linestyle=linestyle, alpha=0.5)
+                    plt.axvline(x=epoch, color='red', linestyle='--', alpha=0.5)
                     plt.subplot(2, 1, 2)
-                    plt.axvline(x=epoch, color=color, linestyle=linestyle, alpha=0.5)
+                    plt.axvline(x=epoch, color='red', linestyle='--', alpha=0.5)
             
             plt.tight_layout()
             
-            # Save the current run figure
+            # Save the figure
             plt.savefig(os.path.join(self.log_dir, 'training_history.png'), dpi=300)
             plt.close()
             
-            # Create comprehensive historical plot if we have complete history data
-            if 'complete_history' in self.history and self.history['complete_history']:
-                self._plot_comprehensive_history()
-                
-            logger.info(f"✓ Training history plots saved to {self.log_dir}")
+            logger.info(f"✓ Training history plot saved to {self.log_dir}/training_history.png")
         except Exception as e:
             logger.warning(f"Failed to plot training history: {str(e)}")
-            
-    def _plot_comprehensive_history(self):
-        """
-        Create a comprehensive plot showing training across all model restarts.
-        Plots global epoch vs metrics for continuity.
-        """
-        try:
-            # Create a new figure for comprehensive history
-            plt.figure(figsize=(14, 10))
-            
-            # Prepare data structures for combined history
-            all_epochs = []
-            all_train_loss = []
-            all_train_acc = []
-            all_val_loss = []
-            all_val_acc = []
-            intervention_points = []
-            intervention_types = []
-            
-            # Process history segments from complete_history
-            global_offset = 0
-            for segment in self.history['complete_history']:
-                # Convert local epochs to global epochs
-                segment_epochs = [global_offset + e for e in segment['epoch']]
-                all_epochs.extend(segment_epochs)
-                
-                # Add metrics
-                all_train_loss.extend(segment['train_loss'])
-                all_train_acc.extend(segment['train_acc'])
-                all_val_loss.extend(segment['val_loss'])
-                all_val_acc.extend(segment['val_acc'])
-                
-                # Update global offset for next segment
-                if len(segment_epochs) > 0:
-                    global_offset = segment_epochs[-1]
-            
-            # Add current history if it's not empty
-            if len(self.history['epoch']) > 0:
-                # Convert current local epochs to global epochs
-                current_epochs = [global_offset + e for e in self.history['epoch']]
-                all_epochs.extend(current_epochs)
-                
-                # Add metrics
-                all_train_loss.extend(self.history['train_loss'])
-                all_train_acc.extend(self.history['train_acc'])
-                all_val_loss.extend(self.history['val_loss'])
-                all_val_acc.extend(self.history['val_acc'])
-            
-            # Collect intervention points
-            for intervention in self.history['rl_interventions']:
-                global_epoch = intervention.get('global_epoch', intervention['epoch'])
-                intervention_points.append(global_epoch)
-                intervention_types.append(intervention.get('is_major', True))
-            
-            # Plot only if we have data
-            if len(all_epochs) < 2:
-                logger.warning("Not enough data points for comprehensive history plot")
-                return
-            
-            # Plot loss
-            plt.subplot(2, 1, 1)
-            plt.plot(all_epochs, all_train_loss, label='Train Loss', color='blue')
-            plt.plot(all_epochs, all_val_loss, label='Val Loss', color='orange')
-            plt.title('Training and Validation Loss (Global History)')
-            plt.xlabel('Global Epoch')
-            plt.ylabel('Loss')
-            plt.grid(True)
-            plt.legend()
-            
-            # Plot accuracy
-            plt.subplot(2, 1, 2)
-            plt.plot(all_epochs, all_train_acc, label='Train Acc', color='blue')
-            plt.plot(all_epochs, all_val_acc, label='Val Acc', color='orange')
-            plt.title('Training and Validation Accuracy (Global History)')
-            plt.xlabel('Global Epoch')
-            plt.ylabel('Accuracy')
-            plt.grid(True)
-            plt.legend()
-            
-            # Mark interventions with different colors for major vs minor
-            for i, global_epoch in enumerate(intervention_points):
-                is_major = intervention_types[i]
-                color = 'red' if is_major else 'green'
-                linestyle = '--' if is_major else ':'
-                label = 'Major Intervention' if is_major else 'Minor Intervention'
-                
-                plt.subplot(2, 1, 1)
-                plt.axvline(x=global_epoch, color=color, linestyle=linestyle, alpha=0.5)
-                plt.subplot(2, 1, 2)
-                plt.axvline(x=global_epoch, color=color, linestyle=linestyle, alpha=0.5)
-            
-            # Add a legend for intervention types
-            import matplotlib.patches as mpatches
-            major_patch = mpatches.Patch(color='red', alpha=0.5, label='Major Intervention')
-            minor_patch = mpatches.Patch(color='green', alpha=0.5, label='Minor Intervention')
-            
-            plt.subplot(2, 1, 1)
-            plt.legend(handles=[major_patch, minor_patch], loc='upper right')
-            
-            plt.tight_layout()
-            
-            # Save the comprehensive history plot
-            plt.savefig(os.path.join(self.log_dir, 'training_history_comprehensive.png'), dpi=300)
-            plt.close()
-            
-            # Save to wandb if available
-            if self.wandb_initialized:
-                try:
-                    wandb.log({"training_history_comprehensive": wandb.Image(
-                        os.path.join(self.log_dir, 'training_history_comprehensive.png'),
-                        caption="Training History (Comprehensive View)"
-                    )})
-                except Exception as e:
-                    logger.warning(f"Failed to log comprehensive history plot to wandb: {str(e)}")
-                    
-            logger.info("✓ Comprehensive training history plot created successfully")
-        except Exception as e:
-            logger.warning(f"Failed to create comprehensive history plot: {str(e)}")
