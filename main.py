@@ -20,6 +20,8 @@ from src.trainers.cnn_trainer import CNNTrainer
 from src.trainers.trainer import ModelTrainer
 from src.envs.hpo_env import HPOEnvironment
 from src.data_loaders.data_loader import load_dataset  # Import the new data loader module
+from src.utils.config_manager import ConfigManager
+from src.utils.env_detector import EnvironmentDetector
 
 # Configure Python logging to support Unicode
 logging.basicConfig(
@@ -92,17 +94,6 @@ def parse_args():
     )
     
     return parser.parse_args()
-
-def load_config(config_path):
-    """Load configuration from YAML file"""
-    try:
-        with open(config_path, "r") as f:
-            config = yaml.safe_load(f)
-        logger.info(f"Loaded configuration from {config_path}")
-        return config
-    except Exception as e:
-        logger.error(f"Failed to load configuration from {config_path}: {e}")
-        raise
 
 def set_seed(seed):
     """Set random seed for reproducibility"""
@@ -186,14 +177,6 @@ def init_wandb(args, config):
         logger.warning(f"Failed to initialize Weights & Biases: {e}")
         return False
 
-def save_config(config, output_dir):
-    """Save configuration to output directory"""
-    os.makedirs(output_dir, exist_ok=True)
-    config_path = os.path.join(output_dir, "config.yaml")
-    with open(config_path, "w") as f:
-        yaml.dump(config, f, default_flow_style=False)
-    logger.info(f"Saved configuration to {config_path}")
-
 def main():
     """Main function"""
     # Parse command line arguments
@@ -205,14 +188,26 @@ def main():
     # Determine device for training
     device = get_device(args.device)
     
-    # Load configuration
-    config = load_config(args.config)
+    # Load and optimize configuration using ConfigManager
+    try:
+        config = ConfigManager.get_optimized_config(args.config)
+        logger.info(f"Loaded and optimized configuration from {args.config}")
+    except Exception as e:
+        logger.error(f"Failed to load configuration from {args.config}: {e}")
+        raise
     
-    # Override config with command line arguments
+    # Create an override dictionary based on command line arguments
+    override_dict = {}
     if args.epochs is not None:
-        config["training"]["max_epochs"] = args.epochs
+        override_dict['training'] = {'epochs': args.epochs, 'max_epochs': args.epochs}
     if args.batch_size is not None:
-        config["training"]["batch_size"] = args.batch_size
+        if 'training' not in override_dict:
+            override_dict['training'] = {}
+        override_dict['training']['batch_size'] = args.batch_size
+    
+    # Use ConfigManager's deep update to apply overrides
+    if override_dict:
+        ConfigManager._deep_update(config, override_dict)
     
     # Update config paths
     config["output_dir"] = args.output_dir
@@ -235,8 +230,8 @@ def main():
     os.makedirs(log_dir, exist_ok=True)
     config["logging"]["log_dir"] = log_dir
     
-    # Save configuration
-    save_config(config, run_dir)
+    # Save configuration using ConfigManager
+    ConfigManager.save_config(config, run_dir, "config.yaml")
     
     # Initialize wandb - ensure this is done BEFORE any calls to wandb.log()
     wandb_initialized = init_wandb(args, config)
@@ -379,6 +374,10 @@ def main():
         print('\n')
         logger.info(f"✓ Final RL brain saved to {final_brain_path}")
         print('\n')
+        
+        # Save training history using ConfigManager
+        history_path = ConfigManager.export_training_history(trainer.history, run_dir)
+        logger.info(f"✓ Training history saved to {history_path}")
         
         # Finalize wandb
         if wandb_initialized and wandb.run is not None:

@@ -34,23 +34,6 @@ class EnvironmentDetector:
             return False
     
     @staticmethod
-    def has_tpu() -> bool:
-        """Check if TPU is available (Google Colab)"""
-        if not EnvironmentDetector.is_colab():
-            return False
-            
-        try:
-            import torch_xla.core.xla_model as xm
-            return True
-        except ImportError:
-            try:
-                # Alternative check if PyTorch XLA is not imported
-                import os
-                return os.environ.get('COLAB_TPU_ADDR', '') != ''
-            except:
-                return False
-    
-    @staticmethod
     def get_available_memory() -> Dict[str, float]:
         """Get available system memory in GB with safety margin applied"""
         try:
@@ -84,7 +67,6 @@ class EnvironmentDetector:
         """Gather system information"""
         is_colab_env = EnvironmentDetector.is_colab()
         gpu_available = EnvironmentDetector.has_gpu()
-        tpu_available = EnvironmentDetector.has_tpu()
         num_cpus = EnvironmentDetector.get_num_cpus()
         memory = EnvironmentDetector.get_available_memory()
         
@@ -93,7 +75,6 @@ class EnvironmentDetector:
             'python_version': platform.python_version(),
             'is_colab': is_colab_env,
             'gpu_available': gpu_available,
-            'tpu_available': tpu_available,
             'num_cpus': num_cpus,
             'memory': memory
         }
@@ -164,17 +145,22 @@ class EnvironmentDetector:
         # Batch size optimization
         if system_info['is_colab']:
             # Colab usually has good GPU but limited CPU resources
-            if system_info['tpu_available']:
-                # TPU-based optimization
-                optimized_config['training']['batch_size'] = max(64, optimized_config['training'].get('batch_size', 64))
-                optimized_config['training']['use_tpu'] = True
-                optimized_config['training']['amp_enabled'] = False  # TPUs handle precision internally
-            elif system_info['gpu_available']:
-                optimized_config['training']['batch_size'] = max(32, optimized_config['training'].get('batch_size', 32))
-                optimized_config['training']['amp_enabled'] = True  # Use mixed precision to save memory
+            if system_info['gpu_available']:
+                # For Colab GPU: use smaller batches initially and rely on dynamic batch sizing
+                # This prevents early OOM crashes
+                optimized_config['training']['batch_size'] = 32  # Start with moderate batch
+                optimized_config['training']['amp_enabled'] = True  # Always use mixed precision in Colab
+                # Colab-specific optimizations for memory usage
+                optimized_config['data']['cache_images'] = False  # Don't cache PIL images
+                optimized_config['data']['cache_tensors'] = True  # Cache tensors directly
+                optimized_config['data']['max_cache_size_gb'] = 2  # Limit cache size
+                optimized_config['data']['prefetch_factor'] = 2  # Lower prefetch to reduce memory pressure
             else:
-                # CPU-only Colab - be more conservative
-                optimized_config['training']['batch_size'] = min(16, optimized_config['training'].get('batch_size', 16))
+                # CPU-only Colab - be very conservative
+                optimized_config['training']['batch_size'] = 8
+                optimized_config['training']['amp_enabled'] = False
+                optimized_config['data']['cache_images'] = False
+                optimized_config['data']['cache_tensors'] = False  # Disable caching entirely
         else:
             # Local system - be adaptive based on available resources
             if system_info['gpu_available']:
@@ -193,14 +179,19 @@ class EnvironmentDetector:
                 optimized_config['training']['amp_enabled'] = False
         
         # Make sure prefetch factor is reasonable
-        optimized_config['data']['prefetch_factor'] = 2
+        if 'prefetch_factor' not in optimized_config['data']:
+            optimized_config['data']['prefetch_factor'] = 2 if not system_info['is_colab'] else 1
         
         # Stability settings
         optimized_config['training']['dynamic_batch_sizing'] = True  # Enable dynamic batch sizing for OOM prevention
-        optimized_config['training']['gradient_accumulation_steps'] = max(1, 32 // optimized_config['training']['batch_size'])
+        # Use more aggressive gradient accumulation in Colab
+        optimized_config['training']['gradient_accumulation_steps'] = (
+            4 if system_info['is_colab'] else 
+            max(1, 32 // optimized_config['training']['batch_size'])
+        )
         
         # Set checkpoint frequency based on environment (more frequent on less stable environments)
-        optimized_config['training']['checkpoint_freq'] = 5 if system_info['is_colab'] else 10
+        optimized_config['training']['checkpoint_freq'] = 3 if system_info['is_colab'] else 10
         
         # Create checkpoint directories
         EnvironmentDetector.ensure_checkpoint_dirs(optimized_config)
@@ -208,7 +199,10 @@ class EnvironmentDetector:
         # Log optimizations
         logger.info(f"Environment optimizations applied for "
                    f"{'Google Colab' if system_info['is_colab'] else 'Local System'} "
-                   f"with {'TPU' if system_info.get('tpu_available', False) else 'GPU' if system_info['gpu_available'] else 'CPU'}")
+                   f"with {'GPU' if system_info['gpu_available'] else 'CPU'}")
+        
+        if system_info['is_colab']:
+            logger.info("Colab-specific optimizations applied to prevent memory issues")
         
         return optimized_config
     

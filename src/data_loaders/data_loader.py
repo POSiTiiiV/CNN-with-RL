@@ -30,9 +30,18 @@ GLOBAL_IMAGE_CACHE = {}
 
 # Add memory monitoring
 
-def is_memory_critical():
-    """Check if system memory is critically low"""
-    return psutil.virtual_memory().available < 1 * 1024 * 1024 * 1024  # 1GB threshold
+def is_memory_critical(colab_threshold=2 * 1024 * 1024 * 1024, local_threshold=1 * 1024 * 1024 * 1024):
+    """Check if system memory is critically low with different thresholds for Colab and local environments"""
+    try:
+        # Check if we're in Colab
+        import google.colab
+        is_colab = True
+    except ImportError:
+        is_colab = False
+    
+    # Use a more aggressive threshold for Colab (2GB) compared to local (1GB)
+    threshold = colab_threshold if is_colab else local_threshold
+    return psutil.virtual_memory().available < threshold
 
 class OptimizedFundusDataset(Dataset):
     def __init__(self, df, images_dir, transform=None, cache_images=True, cache_tensors=True, 
@@ -77,14 +86,26 @@ class OptimizedFundusDataset(Dataset):
         start_time = time.time()
         total = len(self.data)
         
-        # Add memory usage monitoring
-        max_cache_size = self.config.get("max_cache_size_gb", 4) * 1024 * 1024 * 1024  # 4GB default
+        # Detect if we're in Colab for environment-specific settings
+        try:
+            import google.colab
+            is_colab = True
+            logger.info("Colab environment detected - using specialized memory management")
+        except ImportError:
+            is_colab = False
+        
+        # Adjust max cache size based on environment
+        default_cache_size = 2 if is_colab else 4  # 2GB for Colab, 4GB for local
+        max_cache_size = self.config.get("max_cache_size_gb", default_cache_size) * 1024 * 1024 * 1024
         current_cache_size = 0
+        
+        # Colab environments need more frequent memory checks
+        check_interval = 20 if is_colab else 100
         
         with tqdm(total=total, desc=f"Caching {self.dataset_type} images", unit="image") as progress:
             for idx in range(total):
-                if idx % 100 == 0 and is_memory_critical():
-                    logger.warning("⚠️ System memory critically low. Stopping preloading.")
+                if idx % check_interval == 0 and is_memory_critical():
+                    logger.warning("⚠️ System memory getting low. Stopping preloading.")
                     break
                 
                 row = self.data.iloc[idx]
@@ -94,7 +115,7 @@ class OptimizedFundusDataset(Dataset):
                 # Use filename as key for better sharing across datasets
                 cache_key = filename
                 
-                # Before adding to cache, check size
+                # Check if we're approaching cache size limit
                 if current_cache_size > max_cache_size:
                     logger.warning(f"⚠️ Cache size limit reached ({max_cache_size/1e9:.1f}GB). Stopping preloading.")
                     break
@@ -103,12 +124,20 @@ class OptimizedFundusDataset(Dataset):
                     try:
                         image = Image.open(img_path).convert('RGB')
                         
+                        # In Colab, prefer tensor caching over PIL image caching to optimize GPU usage
+                        if is_colab:
+                            self.cache_images = False
+                            self.cache_tensors = True
+                        
                         # If caching tensors directly, apply transform now
                         if self.cache_tensors and self.transform:
                             tensor_img = self.transform(image)
                             self.tensor_cache[cache_key] = tensor_img
                             # No need to store the PIL image if we're caching the tensor
                             if not self.cache_images:
+                                # Force image cleanup
+                                image.close()
+                                del image
                                 continue
                         
                         if self.cache_images:
@@ -121,13 +150,25 @@ class OptimizedFundusDataset(Dataset):
                 else:
                     progress.update(1)
                 
-                # After adding to cache
-                if idx % 100 == 0:
-                    # Estimate current memory usage
-                    if self.cache_tensors:
-                        # Estimate tensor memory
-                        # Each float32 tensor of [3, 224, 224] is about 602KB
-                        current_cache_size = len(self.tensor_cache) * 602 * 1024
+                # More accurate memory usage estimation
+                if idx % check_interval == 0:
+                    # Calculate current usage more precisely using psutil
+                    ram_used = psutil.virtual_memory().used / (1024 * 1024 * 1024)  # GB
+                    logger.debug(f"Current RAM usage: {ram_used:.2f}GB")
+                    
+                    # Force Python garbage collection occasionally
+                    if is_colab and idx % (check_interval * 5) == 0:
+                        import gc
+                        gc.collect()
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+        
+        # Final memory cleanup
+        if is_colab:
+            import gc
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
         
         elapsed = time.time() - start_time
         logger.info(f"Completed caching in {elapsed:.2f}s - Images: {len(self.images_cache)}, Tensors: {len(self.tensor_cache)}")
