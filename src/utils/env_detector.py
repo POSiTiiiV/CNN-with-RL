@@ -34,6 +34,20 @@ class EnvironmentDetector:
             return False
     
     @staticmethod
+    def is_t4_gpu() -> bool:
+        """Check if the GPU is a Tesla T4 (commonly available in Colab)"""
+        try:
+            import torch
+            if not torch.cuda.is_available():
+                return False
+            
+            # Get GPU device name
+            device_name = torch.cuda.get_device_name(0).lower()
+            return "t4" in device_name
+        except:
+            return False
+    
+    @staticmethod
     def get_available_memory() -> Dict[str, float]:
         """Get available system memory in GB with safety margin applied"""
         try:
@@ -67,6 +81,7 @@ class EnvironmentDetector:
         """Gather system information"""
         is_colab_env = EnvironmentDetector.is_colab()
         gpu_available = EnvironmentDetector.has_gpu()
+        is_t4_gpu = EnvironmentDetector.is_t4_gpu() if gpu_available else False
         num_cpus = EnvironmentDetector.get_num_cpus()
         memory = EnvironmentDetector.get_available_memory()
         
@@ -75,6 +90,7 @@ class EnvironmentDetector:
             'python_version': platform.python_version(),
             'is_colab': is_colab_env,
             'gpu_available': gpu_available,
+            'is_t4_gpu': is_t4_gpu,
             'num_cpus': num_cpus,
             'memory': memory
         }
@@ -146,21 +162,38 @@ class EnvironmentDetector:
         if system_info['is_colab']:
             # Colab usually has good GPU but limited CPU resources
             if system_info['gpu_available']:
-                # For Colab GPU: use smaller batches initially and rely on dynamic batch sizing
-                # This prevents early OOM crashes
-                optimized_config['training']['batch_size'] = 32  # Start with moderate batch
-                optimized_config['training']['amp_enabled'] = True  # Always use mixed precision in Colab
-                # Colab-specific optimizations for memory usage
-                optimized_config['data']['cache_images'] = False  # Don't cache PIL images
-                optimized_config['data']['cache_tensors'] = True  # Cache tensors directly
-                optimized_config['data']['max_cache_size_gb'] = 2  # Limit cache size
-                optimized_config['data']['prefetch_factor'] = 2  # Lower prefetch to reduce memory pressure
+                # Special optimization for Tesla T4 GPU with 15.83GB memory
+                if system_info['is_t4_gpu']:
+                    logger.info("Tesla T4 GPU detected in Colab - applying T4-specific optimizations")
+                    # T4 has substantial memory, so we can use larger batch sizes
+                    optimized_config['training']['batch_size'] = 64  # Start with larger batch size for T4
+                    optimized_config['training']['amp_enabled'] = True  # Always use mixed precision
+                    optimized_config['data']['cache_images'] = False  # Don't cache PIL images
+                    optimized_config['data']['cache_tensors'] = True  # Cache tensors directly
+                    optimized_config['data']['max_cache_size_gb'] = 6  # T4 has more memory, allow larger cache
+                    optimized_config['data']['prefetch_factor'] = 3  # Increase prefetch for T4
+                    optimized_config['training']['gradient_accumulation_steps'] = 2  # Fewer accumulation steps needed
+                    # Add T4-specific optimizations
+                    optimized_config['training']['use_mixed_precision'] = True  # Enable mixed precision training
+                    optimized_config['training']['dynamic_batch_sizing'] = True  # Keep dynamic sizing for safety
+                else:
+                    # For other Colab GPUs: use smaller batches initially and rely on dynamic batch sizing
+                    # This prevents early OOM crashes
+                    optimized_config['training']['batch_size'] = 32  # Start with moderate batch
+                    optimized_config['training']['amp_enabled'] = True  # Always use mixed precision in Colab
+                    # Colab-specific optimizations for memory usage
+                    optimized_config['data']['cache_images'] = False  # Don't cache PIL images
+                    optimized_config['data']['cache_tensors'] = True  # Cache tensors directly
+                    optimized_config['data']['max_cache_size_gb'] = 2  # Limit cache size
+                    optimized_config['data']['prefetch_factor'] = 2  # Lower prefetch to reduce memory pressure
+                    optimized_config['training']['gradient_accumulation_steps'] = 4  # More accumulation steps for smaller GPUs
             else:
                 # CPU-only Colab - be very conservative
                 optimized_config['training']['batch_size'] = 8
                 optimized_config['training']['amp_enabled'] = False
                 optimized_config['data']['cache_images'] = False
                 optimized_config['data']['cache_tensors'] = False  # Disable caching entirely
+                optimized_config['training']['gradient_accumulation_steps'] = 8  # More accumulation steps for CPU
         else:
             # Local system - be adaptive based on available resources
             if system_info['gpu_available']:
@@ -180,15 +213,15 @@ class EnvironmentDetector:
         
         # Make sure prefetch factor is reasonable
         if 'prefetch_factor' not in optimized_config['data']:
-            optimized_config['data']['prefetch_factor'] = 2 if not system_info['is_colab'] else 1
+            if system_info['is_t4_gpu']:
+                optimized_config['data']['prefetch_factor'] = 3
+            elif system_info['is_colab']:
+                optimized_config['data']['prefetch_factor'] = 2
+            else:
+                optimized_config['data']['prefetch_factor'] = 2
         
         # Stability settings
         optimized_config['training']['dynamic_batch_sizing'] = True  # Enable dynamic batch sizing for OOM prevention
-        # Use more aggressive gradient accumulation in Colab
-        optimized_config['training']['gradient_accumulation_steps'] = (
-            4 if system_info['is_colab'] else 
-            max(1, 32 // optimized_config['training']['batch_size'])
-        )
         
         # Set checkpoint frequency based on environment (more frequent on less stable environments)
         optimized_config['training']['checkpoint_freq'] = 3 if system_info['is_colab'] else 10
@@ -201,7 +234,9 @@ class EnvironmentDetector:
                    f"{'Google Colab' if system_info['is_colab'] else 'Local System'} "
                    f"with {'GPU' if system_info['gpu_available'] else 'CPU'}")
         
-        if system_info['is_colab']:
+        if system_info['is_t4_gpu']:
+            logger.info("Tesla T4 GPU optimizations applied - using larger batch sizes and memory cache")
+        elif system_info['is_colab']:
             logger.info("Colab-specific optimizations applied to prevent memory issues")
         
         return optimized_config

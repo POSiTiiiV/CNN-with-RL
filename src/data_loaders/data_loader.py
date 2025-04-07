@@ -296,16 +296,48 @@ def load_dataset(config, data_dir):
     logger.info("Loading fundus image dataset with highly optimized performance...")
     print('\n')
     
+    # Detect if we're using a Tesla T4 GPU in Colab
+    try:
+        import google.colab
+        import torch
+        is_colab = True
+        is_t4_gpu = False
+        if torch.cuda.is_available():
+            device_name = torch.cuda.get_device_name(0).lower()
+            is_t4_gpu = "t4" in device_name
+            if is_t4_gpu:
+                logger.info("Tesla T4 GPU detected in Colab - applying T4-specific data loading optimizations")
+    except ImportError:
+        is_colab = False
+        is_t4_gpu = False
+    
     # Get configuration values
     batch_size = config["training"].get("batch_size", 32)
-    num_workers = config["data"].get("num_workers", min(os.cpu_count() or 1, 4))
+    
+    # T4-specific optimizations for Colab
+    if is_t4_gpu:
+        # T4 has 16GB of memory, so we can use more aggressive settings
+        num_workers = min(4, config["data"].get("num_workers", 4))  # T4 can handle more workers
+        cache_images = False  # Don't cache PIL images
+        cache_tensors = True  # Cache tensors directly
+        use_global_cache = True  # Enable global cache sharing
+        max_cache_size_gb = config["data"].get("max_cache_size_gb", 6)
+        prefetch_factor = config["data"].get("prefetch_factor", 3)
+        persistent_workers = True
+        logger.info(f"T4-optimized settings - batch_size: {batch_size}, workers: {num_workers}, cache: {max_cache_size_gb}GB")
+    else:
+        # Regular optimization
+        num_workers = config["data"].get("num_workers", min(os.cpu_count() or 1, 4))
+        cache_images = config["data"].get("cache_images", True)
+        cache_tensors = config["data"].get("cache_tensors", True)
+        use_global_cache = config["data"].get("use_global_cache", True)
+        max_cache_size_gb = config["data"].get("max_cache_size_gb", 4)
+        prefetch_factor = config["data"].get("prefetch_factor", 2)
+        persistent_workers = config["data"].get("persistent_workers", True)
+    
     image_size = config["data"].get("image_size", 224)
     train_split = config["data"].get("train_val_split", 0.8)
-    cache_images = config["data"].get("cache_images", True)
-    cache_tensors = config["data"].get("cache_tensors", True)  # New option
-    use_global_cache = config["data"].get("use_global_cache", True)  # New option
     minimal_transform = config["data"].get("minimal_transform", True)
-    persistent_workers = config["data"].get("persistent_workers", True)  # New option
     
     # CSV file path
     csv_path = os.path.join(os.path.dirname(data_dir), "csv_files/balanced_full_df.csv")
@@ -324,6 +356,7 @@ def load_dataset(config, data_dir):
                 f"Image caching: {'enabled' if cache_images else 'disabled'}\n"
                 f"Tensor caching: {'enabled' if cache_tensors else 'disabled'}\n"
                 f"Global cache sharing: {'enabled' if use_global_cache else 'disabled'}\n"
+                f"Max cache size: {max_cache_size_gb}GB\n"
                 f"Transformations: {'minimal' if minimal_transform else 'full'}\n"
                 f"Persistent workers: {'enabled' if persistent_workers else 'disabled'}")
     
@@ -454,23 +487,16 @@ def load_dataset(config, data_dir):
         warmup_start = time.time()
         print('\n')
         logger.info("Warming up train dataloader...")
-        print('\n')
         warmup_dataloader(train_loader, name="train")
-        print('\n')
         logger.info("Warming up val dataloader...")
-        print('\n')
         warmup_dataloader(val_loader, name="val")
-        print('\n')
         logger.info("Warming up test dataloader...")
-        print('\n')
         warmup_dataloader(test_loader, name="test")
-        print('\n')
         logger.info("DataLoader warmup completed")
         print('\n')
         logger.info(f"DataLoader warmup completed in {time.time() - warmup_start:.2f}s")
     
     total_time = time.time() - start_time
-    print('\n')
     logger.info("Total dataset preparation time: {total_time:.2f}s")
     print('\n')
     

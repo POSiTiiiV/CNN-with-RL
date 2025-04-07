@@ -414,7 +414,8 @@ class ModelTrainer:
         for key, new_val in new_hyperparams.items():
             old_val = old_hyperparams.get(key, "N/A")
             if isinstance(new_val, float):
-                hp_changes += f"{key}: {old_val:.6f if isinstance(old_val, float) else old_val} → {new_val:.6f}\n"
+                formatted_old = f"{old_val:.6f}" if isinstance(old_val, float) else str(old_val)
+                hp_changes += f"{key}: {formatted_old} → {new_val:.6f}\n"
             else:
                 hp_changes += f"{key}: {old_val} → {new_val}\n"
         hp_changes += "-------------------------------"
