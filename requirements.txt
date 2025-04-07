@@ -5,7 +5,6 @@ matplotlib
 scikit-learn
 opencv-python
 tqdm
-rich
 tensorboard
 scikit-image
 gymnasium

@@ -9,14 +9,12 @@ import matplotlib.pyplot as plt
 from typing import Dict, List, Any, Optional, Union, Tuple
 import copy
 import wandb
-# Removing Rich imports
+import logging
 from io import StringIO
-from loguru import logger
 from ..utils.utils import create_observation, enhance_observation_with_trends, calculate_performance_trends, is_significant_hyperparameter_change
 
-# Initialize standard logging instead of rich console
-import logging
-logging_console = logging.getLogger("trainer")
+# Initialize standard logging
+logger = logging.getLogger(__name__)
 
 class ModelTrainer:
     """
